@@ -63,35 +63,63 @@ public:
       : forOp(forOp), numStages(numStages), opLatency(opLatency) {};
 
   void run() {
+    LDBG("  === AssignLoadLatencies::run() ===");
+    LDBG("  Loop attributes:");
+    for (auto attr : forOp->getAttrs()) {
+      LDBG("    " << attr.getName() << " = " << attr.getValue());
+    }
     bool pipelineWithoutDot = forOp->hasAttr(mlir::triton::kNumStagesAttrName);
+    LDBG("  Looking for attribute: " << mlir::triton::kNumStagesAttrName);
+    LDBG("  pipelineWithoutDot: " << pipelineWithoutDot);
+    
+    // WORKAROUND: If numStages > 1, enable pipelineWithoutDot even if attribute is missing
+    // This handles the case where Python num_stages=3 doesn't set the MLIR attribute
+    if (!pipelineWithoutDot && numStages > 1) {
+      LDBG("  WORKAROUND: numStages=" << numStages << " > 1, enabling pipelineWithoutDot");
+      pipelineWithoutDot = true;
+    }
     ModuleOp moduleOp = forOp->getParentOfType<ModuleOp>();
     tt::ModuleAxisInfoAnalysis axisInfoAnalysis(moduleOp);
 
     llvm::MapVector<Operation *, int> loadOpToIndLevel =
         loadOpsToIndirectionLevel(forOp, pipelineWithoutDot, axisInfoAnalysis);
-    if (loadOpToIndLevel.empty())
+    LDBG("  Found " << loadOpToIndLevel.size() << " load ops with indirection levels");
+    for (auto [op, level] : loadOpToIndLevel) {
+      LDBG("    Load op: " << *op << " -> indirection level: " << level);
+    }
+    
+    if (loadOpToIndLevel.empty()) {
+      LDBG("  No load ops found, returning");
       return;
+    }
 
     // We assume loads with different dist are assigned to different stages.
     // If numStages is 2, we will have no stage available for indirect loads
     // with dist >= 1. In general, when dist is equal to numStages - 1, we
     // should not pipeline it.
+    int originalSize = loadOpToIndLevel.size();
     for (auto iter = loadOpToIndLevel.begin();
          iter != loadOpToIndLevel.end();) {
-      if (iter->second >= numStages - 1)
+      if (iter->second >= numStages - 1) {
+        LDBG("    Removing load op with indirection level " << iter->second << " >= " << (numStages - 1));
         iter = loadOpToIndLevel.erase(iter);
-      else
+      } else {
         ++iter;
+      }
     }
+    LDBG("  Filtered " << originalSize << " -> " << loadOpToIndLevel.size() << " load ops");
 
     // Calculate the stage distance between applicable loads.
     auto vals = llvm::make_second_range(loadOpToIndLevel);
     int maxIndirectionLevel = vals.empty() ? 0 : *llvm::max_element(vals);
     unsigned loadLatency = (numStages - 1) / (maxIndirectionLevel + 1);
+    LDBG("  maxIndirectionLevel: " << maxIndirectionLevel << ", loadLatency: " << loadLatency);
 
     for (auto [loadOp, dist] : loadOpToIndLevel) {
+      LDBG("    Assigning latency " << loadLatency << " to load op: " << *loadOp);
       opLatency[loadOp] = loadLatency;
     }
+    LDBG("  === AssignLoadLatencies::run() finished ===");
   }
 
 private:
@@ -108,23 +136,36 @@ private:
 
   bool isPipeliningBeneficial(Operation *op, Operation *finalUser,
                               tt::ModuleAxisInfoAnalysis &axisInfoAnalysis) {
+    LDBG("        === isPipeliningBeneficial() for " << *op << " ===");
+    
     if (auto loadOp = dyn_cast<tt::LoadOp>(op)) {
-      if (!canBeConvertedToAsyncLoad(loadOp, axisInfoAnalysis)) {
+      bool canConvert = canBeConvertedToAsyncLoad(loadOp, axisInfoAnalysis);
+      LDBG("        canBeConvertedToAsyncLoad: " << canConvert);
+      if (!canConvert) {
         LDBG("Load " << *loadOp << " is too small for pipelining");
         return false;
       }
     }
-    if (isa<tt::DescriptorLoadOp, tt::DescriptorGatherOp>(op))
+    
+    if (isa<tt::DescriptorLoadOp, tt::DescriptorGatherOp>(op)) {
+      LDBG("        Descriptor load/gather op, allowing pipelining");
       return true;
-    if (!canHaveSharedEncoding(cast<tt::LoadOp>(op))) {
+    }
+    
+    bool hasSharedEnc = canHaveSharedEncoding(cast<tt::LoadOp>(op));
+    LDBG("        canHaveSharedEncoding: " << hasSharedEnc);
+    if (!hasSharedEnc) {
       LDBG("Load " << *op << " cannot have shared encoding");
       return false;
     }
 
     ttg::SharedEncodingTrait localAllocEnc;
-    if (llvm::any_of(op->getUsers(), [&](Operation *user) {
+    bool hasLocalAllocUsers = llvm::any_of(op->getUsers(), [&](Operation *user) {
           return isa<ttg::LocalAllocOp>(user);
-        })) {
+        });
+    LDBG("        hasLocalAllocUsers: " << hasLocalAllocUsers);
+    
+    if (hasLocalAllocUsers) {
       for (auto user : op->getUsers()) {
         auto localAlloc = dyn_cast<ttg::LocalAllocOp>(user);
         if (!localAlloc)
@@ -137,6 +178,7 @@ private:
         if (enc != localAllocEnc) {
           // If the load is used by a LocalAllocOp, all the users need to have
           // the same encoding.
+          LDBG("        Multiple LocalAllocOp users with different encodings, rejecting");
           return false;
         }
       }
@@ -145,12 +187,15 @@ private:
     if (localAllocEnc) {
       auto registerTy = cast<RankedTensorType>(op->getResultTypes()[0]);
       auto vecBytes = getCopyVecBytes(registerTy, localAllocEnc);
+      LDBG("        vecBytes for cp.async: " << vecBytes);
       if (vecBytes < 4) {
         // At least 4 bytes need to be consecutive for cp.async
+        LDBG("        vecBytes < 4, rejecting for cp.async requirement");
         return false;
       }
     }
 
+    LDBG("        isPipeliningBeneficial returning true");
     return true;
   }
 
@@ -161,6 +206,7 @@ private:
   llvm::MapVector<Operation *, int>
   loadOpsToIndirectionLevel(scf::ForOp forOp, bool pipelineWithoutDot,
                             tt::ModuleAxisInfoAnalysis &axisInfoAnalysis) {
+    LDBG("    === loadOpsToIndirectionLevel() ===");
     llvm::MapVector<Operation *, int> loadOpToIndLevel;
     DenseSet<Operation *> seen;
     DenseSet<Operation *> excluded;
@@ -171,7 +217,10 @@ private:
             return;
           if (isa<tt::LoadOp, tt::DescriptorLoadOp, tt::DescriptorGatherOp>(
                   op)) {
-            if (!isPipeliningBeneficial(op, finalUser, axisInfoAnalysis))
+            LDBG("      Found load op: " << *op);
+            bool beneficial = isPipeliningBeneficial(op, finalUser, axisInfoAnalysis);
+            LDBG("      isPipeliningBeneficial: " << beneficial);
+            if (!beneficial)
               return;
             if (loadOpToIndLevel.count(op)) {
               int level = loadOpToIndLevel[op];
@@ -208,25 +257,39 @@ private:
         };
 
     bool seenDot = false;
+    LDBG("    Looking for dot operations in loop...");
     for (Operation &op : forOp.getBody()->without_terminator()) {
       // Arbitrary heuristic. TMEMStoreOp is included to keep logic consistent
       // with legacy code when we weren't hoisting tmem allocas.
       if (!isa<mlir::triton::DotOpInterface, ttng::TMEMStoreOp>(op))
         continue;
+      LDBG("    Found dot op: " << op);
       seenDot = true;
       seen.clear();
       dfs(&op, &op, 0);
     }
+    LDBG("    seenDot: " << seenDot);
 
     // If the loop has numStages attribute, also consider pipelining other loads
     // that are not directly used by dot ops.
     if (pipelineWithoutDot && !seenDot) {
+      LDBG("    No dots found, pipelineWithoutDot=true, traversing from non-load ops...");
+      int nonLoadOpCount = 0;
       for (Operation &op : forOp.getBody()->without_terminator()) {
-        if (!isa<tt::LoadOp, tt::DescriptorLoadOp, tt::DescriptorGatherOp>(op))
+        if (!isa<tt::LoadOp, tt::DescriptorLoadOp, tt::DescriptorGatherOp>(op)) {
+          nonLoadOpCount++;
+          LDBG("      Starting DFS from non-load op: " << op);
           dfs(&op, &op, 0);
+        }
       }
+      LDBG("    Processed " << nonLoadOpCount << " non-load operations");
+    } else if (!pipelineWithoutDot) {
+      LDBG("    pipelineWithoutDot=false, skipping fallback path");
+    } else {
+      LDBG("    seenDot=true, skipping fallback path");
     }
 
+    LDBG("    === loadOpsToIndirectionLevel() finished ===");
     return loadOpToIndLevel;
   }
 };
@@ -310,27 +373,59 @@ private:
 // stages with the sum of latencies in the chain from the first load to the
 // final dot op.
 void assignLatencies(ModuleOp moduleOp, int defaultNumStages) {
+  LDBG("========== STARTING ASSIGN LATENCIES ===========");
+  LDBG("Default num stages: " << defaultNumStages);
+  
   SmallVector<scf::ForOp> loops;
   moduleOp->walk([&](scf::ForOp forOp) {
+    LDBG("Found loop: " << forOp);
+    bool preCondOk = preCondition(forOp);
+    int numStages = getNumStagesOrDefault(forOp, defaultNumStages);
+    LDBG("  preCondition: " << preCondOk << ", numStages: " << numStages);
+    
     // Bail out for loops with num_stage <= 1.
-    if (preCondition(forOp) &&
-        getNumStagesOrDefault(forOp, defaultNumStages) > 1)
+    if (preCondOk && numStages > 1) {
+      LDBG("  Adding loop to processing list");
       loops.push_back(forOp);
+    } else {
+      LDBG("  Skipping loop - preCondition=" << preCondOk << ", numStages=" << numStages);
+    }
   });
-  if (loops.empty())
+  
+  LDBG("Found " << loops.size() << " qualifying loops for latency assignment");
+  if (loops.empty()) {
+    LDBG("No qualifying loops found, returning");
     return;
+  }
 
   DenseMap<Operation *, int> opLatency;
+  int loopIndex = 0;
   for (auto forOp : loops) {
+    LDBG("\n--- Processing loop " << loopIndex << " for latency assignment ---");
     if (hasLatenciesAssigned(forOp)) {
+      LDBG("Loop already has latencies assigned, using user-provided latencies");
       assignUserProvidedLatencies(forOp, opLatency);
       continue;
     }
     int numStages = getNumStagesOrDefault(forOp, defaultNumStages);
+    LDBG("Assigning latencies for loop with " << numStages << " stages");
+    
+    int beforeLoadLatencies = opLatency.size();
     AssignLoadLatencies(forOp, numStages, opLatency).run();
+    int afterLoadLatencies = opLatency.size();
+    LDBG("AssignLoadLatencies added " << (afterLoadLatencies - beforeLoadLatencies) << " latencies");
+    
+    int beforeMMALatencies = opLatency.size();
     AssignMMALatencies(forOp, opLatency).run();
+    int afterMMALatencies = opLatency.size();
+    LDBG("AssignMMALatencies added " << (afterMMALatencies - beforeMMALatencies) << " latencies");
+    
+    loopIndex++;
   }
+  
+  LDBG("Total operations with assigned latencies: " << opLatency.size());
   serializeLatencies(moduleOp, opLatency);
+  LDBG("========== FINISHED ASSIGN LATENCIES ===========");
 }
 
 } // namespace

@@ -148,17 +148,21 @@ Value triton::sinkValueRedefinition(RewriterBase &rewriter, Value in, Value out,
 //===----------------------------------------------------------------------===//
 
 bool mlir::triton::loopHasDistGreaterThanOne(scf::ForOp forOp) {
-  return llvm::any_of(forOp.getBody()->getTerminator()->getOperands(),
+  bool hasDistGreaterThanOne = llvm::any_of(forOp.getBody()->getTerminator()->getOperands(),
                       [](Value operand) {
                         Operation *def = operand.getDefiningOp();
                         return !def;
                       });
+  LDBG("Loop has distance > 1: " << hasDistGreaterThanOne);
+  return hasDistGreaterThanOne;
 }
 
 bool mlir::triton::isOuterLoop(scf::ForOp forOp) {
-  return llvm::any_of(forOp.getBody()->getOperations(), [](Operation &op) {
+  bool isOuter = llvm::any_of(forOp.getBody()->getOperations(), [](Operation &op) {
     return isa<scf::ForOp, scf::WhileOp>(op);
   });
+  LDBG("Loop is outer loop: " << isOuter);
+  return isOuter;
 }
 
 // Function to mask operations during scheduling.
@@ -329,8 +333,10 @@ bool mlir::triton::canBeConvertedToAsyncLoad(
     vec = std::min<unsigned>(vec, axisInfoAnalysis.getMaskAlignment(mask));
 
   auto tensorTy = dyn_cast<RankedTensorType>(ptr.getType());
-  if (!tensorTy)
+  if (!tensorTy) {
+    LDBG("Load " << *loadOp << " cannot be async: not a ranked tensor type");
     return false;
+  }
   auto ty = cast<tt::PointerType>(tensorTy.getElementType()).getPointeeType();
   unsigned width = vec * ty.getIntOrFloatBitWidth();
 
@@ -339,8 +345,10 @@ bool mlir::triton::canBeConvertedToAsyncLoad(
   // 2. It's likely that pipling small loads won't offer much performance
   //    improvement and may even hurt performance by increasing register
   //    pressure.
-  LDBG("Load " << *loadOp << " has width " << width);
-  return width >= 32;
+  LDBG("Load " << *loadOp << " has width " << width << " (vec=" << vec << ", elementBits=" << ty.getIntOrFloatBitWidth() << ")");
+  bool canBeAsync = width >= 32;
+  LDBG("  canBeConvertedToAsyncLoad: " << canBeAsync);
+  return canBeAsync;
 }
 
 void mlir::triton::serializeLatencies(ModuleOp module,
@@ -437,6 +445,7 @@ bool mlir::triton::isTMALoad(Operation *op) {
 
 bool mlir::triton::canBeAsyncLoad(Operation *op) {
   if (mlir::triton::isTMALoad(op)) {
+    LDBG("Op " << *op << " can be async load (TMA load)");
     return true;
   }
   assert(isa<tt::LoadOp>(op));
@@ -445,9 +454,12 @@ bool mlir::triton::canBeAsyncLoad(Operation *op) {
   // bytes)
   int copyVecBytes = mlir::triton::getCopyVecBytes(
       cast<RankedTensorType>(op->getResultTypes()[0]), sharedEncoding);
+  LDBG("Op " << *op << " copyVecBytes=" << copyVecBytes);
   if (copyVecBytes >= 4) {
+    LDBG("  Can be async load (sufficient bytes)");
     return true;
   }
+  LDBG("  Cannot be async load (insufficient bytes)");
   return false;
 }
 

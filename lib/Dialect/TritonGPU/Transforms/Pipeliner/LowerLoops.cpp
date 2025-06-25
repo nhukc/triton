@@ -444,18 +444,44 @@ bool loadRequiresAdditionalBuffer(Operation *loadOp) {
 
 scf::ForOp lowerLoads(scf::ForOp forOp, CoarseSchedule &schedule,
                       triton::ModuleAxisInfoAnalysis &axisInfoAnalysis) {
+  LDBG("========== LOWERING LOADS ===========");
+  
   llvm::MapVector<Operation *, AsyncLoad> asyncLoads;
   llvm::MapVector<int, LoadGroupInfo> loadGroups;
+  
+  // Count different types of loads
+  int totalLoads = 0;
+  int tmaLoads = 0;
+  int regularLoads = 0;
+  int pipelinedLoads = 0;
+  int nonPipelinedLoads = 0;
+  
   // Only visit the top level ops, we do not support pipelining conditional
   // loads for now
   for (auto &op : forOp.getBody()->without_terminator()) {
     if (isa<tt::LoadOp, tt::DescriptorLoadOp, tt::DescriptorGatherOp>(op)) {
+      totalLoads++;
+      
+      if (isa<tt::DescriptorLoadOp, tt::DescriptorGatherOp>(op)) {
+        tmaLoads++;
+        LDBG("  Found TMA load: " << op);
+      } else {
+        regularLoads++;
+        LDBG("  Found regular load: " << op);
+      }
+      
       int stageDiff = getDefUseStageDiff(&op, forOp, schedule);
+      LDBG("    Stage difference: " << stageDiff);
+      
       if (stageDiff == 0 || !isa<RankedTensorType>(op.getResultTypes()[0])) {
         // Don't care about non-pipelined loads. Don't use async loads for
         // scalar values.
+        nonPipelinedLoads++;
+        LDBG("    Load not pipelined (stageDiff=0 or scalar)");
         continue;
       }
+      
+      pipelinedLoads++;
       SharedEncodingTrait sharedEncoding = getSharedEncoding(&op);
       // Do not create async loads for small loads (cp.async requires at least 4
       // bytes)
@@ -465,19 +491,25 @@ scf::ForOp lowerLoads(scf::ForOp forOp, CoarseSchedule &schedule,
       int copyVecBytes = getCopyVecBytes(
           cast<RankedTensorType>(op.getResultTypes()[0]), sharedEncoding);
       canUseAsyncCp &= copyVecBytes >= 4;
+      
+      LDBG("    canUseAsyncCp: " << canUseAsyncCp << ", copyVecBytes: " << copyVecBytes << ", isTMALoad: " << isTMALoad(&op));
+      
       if (canUseAsyncCp || isTMALoad(&op)) {
         if (loadRequiresAdditionalBuffer(&op)) {
           // Allocate additional buffer required by the wgmma pipelining.
+          LDBG("    Load requires additional buffer, incrementing stageDiff");
           stageDiff += 1;
         }
         auto &asyncLoad = asyncLoads[&op];
         asyncLoad.stageDiff = stageDiff;
         asyncLoad.sharedEncoding = sharedEncoding;
+        LDBG("    Added to asyncLoads with stageDiff: " << stageDiff);
       } else if (stageDiff > 1) {
         // Distance-1 loads can in most cases be pipelined in registers without
         // any performance degradation, as the schedule will usually reorder the
         // user and the producer so there is no liverange overlap, and no copy
         // needed.
+        LDBG("    Load cannot use vectorized copy, will pipeline in registers");
         op.emitRemark() << "Pipelining load that cannot use vectorized "
                            "copy. This will likely "
                            "lead to pipelining in registers and severe "
@@ -486,8 +518,18 @@ scf::ForOp lowerLoads(scf::ForOp forOp, CoarseSchedule &schedule,
     }
   }
 
-  if (asyncLoads.empty())
+  LDBG("Load analysis summary:");
+  LDBG("  Total loads: " << totalLoads);
+  LDBG("  TMA loads: " << tmaLoads);
+  LDBG("  Regular loads: " << regularLoads);
+  LDBG("  Pipelined loads: " << pipelinedLoads);
+  LDBG("  Non-pipelined loads: " << nonPipelinedLoads);
+  LDBG("  Async loads created: " << asyncLoads.size());
+  
+  if (asyncLoads.empty()) {
+    LDBG("No async loads created, returning original loop");
     return forOp;
+  }
 
   for (auto &[loadOp, asyncLoad] : asyncLoads) {
     Value alloc = createAlloc(forOp, loadOp, asyncLoad.sharedEncoding,
@@ -603,12 +645,24 @@ scf::ForOp lowerLoads(scf::ForOp forOp, CoarseSchedule &schedule,
   }
 
   // Make sure all ops have attributes.
+  LDBG("Verifying all operations are in schedule");
+  int opsNotInSchedule = 0;
   for (Operation &op : forOp.getBody()->without_terminator()) {
     if (!schedule.count(&op)) {
+      opsNotInSchedule++;
+      LDBG("  Op not in schedule: " << op);
       op.emitError() << "op not found in the schedule";
     }
     assert(schedule.count(&op) && "op not found in the schedule");
   }
+  
+  if (opsNotInSchedule == 0) {
+    LDBG("All operations successfully scheduled");
+  } else {
+    LDBG("Found " << opsNotInSchedule << " operations not in schedule");
+  }
+  
+  LDBG("========== FINISHED LOWERING LOADS ===========");
   return forOp;
 }
 
@@ -1016,27 +1070,88 @@ scf::ForOp lowerMMAs(scf::ForOp forOp, CoarseSchedule &schedule) {
 
 void lowerLoop(scf::ForOp forOp,
                triton::ModuleAxisInfoAnalysis &axisInfoAnalysis) {
+  LDBG("========== LOWERING LOOP ===========");
+  
+  // Analyze loop contents before lowering
+  bool hasMatrixMultiply = false;
+  bool hasTMALoads = false;
+  bool hasRegularLoads = false;
+  int numOps = 0;
+  
+  for (auto &op : forOp.getBody()->without_terminator()) {
+    numOps++;
+    if (isa<ttng::MMAv5OpInterface>(op) || isa<ttng::WarpGroupDotOp>(op)) {
+      hasMatrixMultiply = true;
+      LDBG("  Found matrix multiply op: " << op);
+    }
+    if (isa<tt::DescriptorLoadOp, tt::DescriptorGatherOp>(op)) {
+      hasTMALoads = true;
+      LDBG("  Found TMA load op: " << op);
+    }
+    if (isa<tt::LoadOp>(op)) {
+      hasRegularLoads = true;
+      LDBG("  Found regular load op: " << op);
+    }
+  }
+  
+  LDBG("Loop analysis: numOps=" << numOps << ", hasMatrixMultiply=" << hasMatrixMultiply 
+       << ", hasTMALoads=" << hasTMALoads << ", hasRegularLoads=" << hasRegularLoads);
+  
   CoarseSchedule schedule;
   if (failed(schedule.deSerialize(forOp))) {
+    LDBG("Failed to deserialize schedule for loop lowering");
+    
+    if (!hasMatrixMultiply) {
+      LDBG("*** LOOP WITHOUT MATRIX MULTIPLY FAILED IN LOWERING ***");
+      LDBG("    Reason: Failed to deserialize schedule");
+      LDBG("    Loop operations:");
+      for (auto &op : forOp.getBody()->without_terminator()) {
+        LDBG("      " << op);
+      }
+    }
     return;
   }
+  
+  LDBG("Successfully deserialized schedule, proceeding with lowering");
+  LDBG("Schedule has " << schedule.getNumStages() << " stages");
+  
   scf::ForOp newForOp = lowerMMAs(forOp, schedule);
+  LDBG("Completed MMA lowering");
+  
   newForOp = lowerLoads(newForOp, schedule, axisInfoAnalysis);
+  LDBG("Completed load lowering");
+  
   newForOp = lowerTMADescriptors(newForOp, schedule);
+  LDBG("Completed TMA descriptor lowering");
+  
   schedule.serialize(newForOp);
+  LDBG("Successfully serialized final schedule");
 }
 
 } // namespace
 
 void lowerLoops(ModuleOp moduleOp) {
+  LDBG("========== STARTING LOOP LOWERING ===========");
+  
   triton::ModuleAxisInfoAnalysis axisInfoAnalysis(moduleOp);
   SmallVector<scf::ForOp> loops;
   moduleOp->walk([&](scf::ForOp forOp) { loops.push_back(forOp); });
-  if (loops.empty())
+  
+  LDBG("Found " << loops.size() << " loops to lower");
+  
+  if (loops.empty()) {
+    LDBG("No loops found, returning");
     return;
-  for (auto forOp : loops) {
-    lowerLoop(forOp, axisInfoAnalysis);
   }
+  
+  int loopIndex = 0;
+  for (auto forOp : loops) {
+    LDBG("\n--- Lowering loop " << loopIndex << " ---");
+    lowerLoop(forOp, axisInfoAnalysis);
+    loopIndex++;
+  }
+  
+  LDBG("========== FINISHED LOOP LOWERING ===========");
 }
 
 } // namespace gpu

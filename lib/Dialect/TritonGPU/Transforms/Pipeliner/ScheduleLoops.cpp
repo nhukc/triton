@@ -33,25 +33,44 @@ bool hasGpuBarriers(scf::ForOp forOp) {
 // Return true if the preconditions for pipelining the loop are met.
 bool isSafeToPipeline(scf::ForOp forOp,
                       const DenseMap<Operation *, int> &opLatency) {
+  LDBG("Checking if loop is safe to pipeline: " << forOp);
+  
   // Skip loop with distance > 1.
-  if (loopHasDistGreaterThanOne(forOp))
+  if (loopHasDistGreaterThanOne(forOp)) {
+    LDBG("Loop has distance > 1, skipping pipeline");
     return false;
+  }
+  
   // Don't pipeline outer loops.
-  if (isOuterLoop(forOp))
+  if (isOuterLoop(forOp)) {
+    LDBG("Loop is outer loop, skipping pipeline");
     return false;
+  }
+  
   // Skip loops with barriers.
-  if (hasGpuBarriers(forOp))
+  if (hasGpuBarriers(forOp)) {
+    LDBG("Loop has GPU barriers, skipping pipeline");
     return false;
+  }
+  
+  LDBG("Loop is safe to pipeline");
   return true;
 }
 
 bool hasLatenciesAssigned(scf::ForOp forOp,
                           const DenseMap<Operation *, int> &opLatency) {
+  LDBG("Checking if loop has latencies assigned");
+  
+  int numOpsWithLatencies = 0;
   for (auto &op : forOp.getBody()->without_terminator()) {
-    if (opLatency.count(&op))
-      return true;
+    if (opLatency.count(&op)) {
+      numOpsWithLatencies++;
+      LDBG("  Op with latency: " << op << " latency=" << opLatency.lookup(&op));
+    }
   }
-  return false;
+  
+  LDBG("Total ops with latencies: " << numOpsWithLatencies);
+  return numOpsWithLatencies > 0;
 }
 
 CoarseSchedule scheduleKeyOps(scf::ForOp forOp,
@@ -155,28 +174,43 @@ CoarseSchedule scheduleKeyOps(scf::ForOp forOp,
 // the rest of the pass will backward propagate dependencies.
 CoarseSchedule getInitialSchedule(scf::ForOp forOp,
                                   const DenseMap<Operation *, int> &opLatency) {
-  if (!isSafeToPipeline(forOp, opLatency))
+  LDBG("Getting initial schedule for loop");
+  
+  if (!isSafeToPipeline(forOp, opLatency)) {
+    LDBG("Loop is not safe to pipeline, returning empty schedule");
     return CoarseSchedule(0);
+  }
 
   // If the loop has assigned latencies, use them to determine the initial
   // schedule.
-  if (hasLatenciesAssigned(forOp, opLatency))
+  if (hasLatenciesAssigned(forOp, opLatency)) {
+    LDBG("Loop has latencies assigned, scheduling key ops");
     return scheduleKeyOps(forOp, opLatency);
+  }
 
   // If the loop has an existing schedule, use it as the base schedule.
   CoarseSchedule schedule;
+  LDBG("Checking for existing warp-specialized schedule");
   if (forOp->hasAttr(kWarpSpecializeAttrName) &&
       succeeded(schedule.deSerialize(forOp))) {
+    LDBG("Found existing warp-specialized schedule, re-scheduling latency ops");
+    
     // The loop was partitioned from a warp-specialized loop, meaning it can
     // have a partial view of the original loop stages. Re-schedule the loop
     // root at the stages of the latency ops to prune unnecessary stages.
     auto isLatencyOp = [&](Operation &op) {
-      return opLatency.count(&op) ||
-             isa<LoadOp, DescriptorLoadOp, DescriptorGatherOp, LocalStoreOp,
+      bool hasExplicitLatency = opLatency.count(&op);
+      bool isImplicitLatencyOp = isa<LoadOp, DescriptorLoadOp, DescriptorGatherOp, LocalStoreOp,
                  LocalLoadOp, ttng::TMEMLoadOp, ttng::TMEMStoreOp,
                  AsyncCopyGlobalToLocalOp, ttng::AsyncTMACopyGlobalToLocalOp,
                  ttng::AsyncTMAGatherOp, ttng::MMAv5OpInterface,
                  ttng::WaitBarrierOp, ttng::ArriveBarrierOp>(op);
+      
+      if (hasExplicitLatency || isImplicitLatencyOp) {
+        LDBG("  Latency op: " << op << " (explicit=" << hasExplicitLatency << ", implicit=" << isImplicitLatencyOp << ")");
+      }
+      
+      return hasExplicitLatency || isImplicitLatencyOp;
     };
 
     // If there are no latency ops or all latency ops are in the same stage, we
@@ -184,12 +218,23 @@ CoarseSchedule getInitialSchedule(scf::ForOp forOp,
     // assigned to the same stage.
     DenseSet<int> latencyStages;
     auto ops = forOp.getBody()->without_terminator();
+    int numLatencyOps = 0;
     for (Operation &op : llvm::make_filter_range(ops, isLatencyOp)) {
+      numLatencyOps++;
       // FIXME: This should assert all latency ops have an assigned stage.
-      if (schedule.count(&op))
-        latencyStages.insert(schedule[&op].first);
+      if (schedule.count(&op)) {
+        int stage = schedule[&op].first;
+        latencyStages.insert(stage);
+        LDBG("  Latency op " << op << " is in stage " << stage);
+      } else {
+        LDBG("  Latency op " << op << " has no assigned stage");
+      }
     }
+    
+    LDBG("Found " << numLatencyOps << " latency ops across " << latencyStages.size() << " unique stages");
+    
     if (latencyStages.size() <= 1) {
+      LDBG("All latency ops in same stage or no latency ops, creating single-stage schedule");
       CoarseSchedule normalized(/*numStages=*/1);
       auto cluster = normalized.clusters.newAtFront();
       for (Operation &op : ops)
@@ -197,10 +242,12 @@ CoarseSchedule getInitialSchedule(scf::ForOp forOp,
       return normalized;
     }
 
+    LDBG("Shrinking existing schedule to fit latency ops");
     schedule.shrinkToFit();
     return schedule;
   }
 
+  LDBG("No existing schedule found, returning empty schedule");
   return CoarseSchedule(0);
 }
 
@@ -347,10 +394,48 @@ void scheduleRemainingToLastStage(scf::ForOp forOp, CoarseSchedule &schedule,
 
 void scheduleLoop(scf::ForOp forOp,
                   const DenseMap<Operation *, int> &opLatency) {
+  LDBG("========== SCHEDULING LOOP ===========");
+  LDBG("Loop: " << forOp);
+  
+  // Check for matrix multiply operations in the loop
+  bool hasMatrixMultiply = false;
+  bool hasTMALoads = false;
+  bool hasRegularLoads = false;
+  int numOps = 0;
+  
+  for (auto &op : forOp.getBody()->without_terminator()) {
+    numOps++;
+    if (isa<ttng::MMAv5OpInterface>(op) || isa<ttng::WarpGroupDotOp>(op)) {
+      hasMatrixMultiply = true;
+      LDBG("  Found matrix multiply op: " << op);
+    }
+    if (isa<tt::DescriptorLoadOp, tt::DescriptorGatherOp>(op)) {
+      hasTMALoads = true;
+      LDBG("  Found TMA load op: " << op);
+    }
+    if (isa<tt::LoadOp>(op)) {
+      hasRegularLoads = true;
+      LDBG("  Found regular load op: " << op);
+    }
+  }
+  
+  LDBG("Loop analysis: numOps=" << numOps << ", hasMatrixMultiply=" << hasMatrixMultiply 
+       << ", hasTMALoads=" << hasTMALoads << ", hasRegularLoads=" << hasRegularLoads);
+  
   // Based on the latencies, schedule the key ops to the stages.
   CoarseSchedule schedule = getInitialSchedule(forOp, opLatency);
-  if (schedule.empty())
+  if (schedule.empty()) {
+    LDBG("Schedule is empty, cannot pipeline this loop");
+    if (!hasMatrixMultiply) {
+      LDBG("*** LOOP WITHOUT MATRIX MULTIPLY FAILED TO PIPELINE ***");
+      LDBG("    Reason: Empty schedule from getInitialSchedule");
+      LDBG("    Loop operations:");
+      for (auto &op : forOp.getBody()->without_terminator()) {
+        LDBG("      " << op);
+      }
+    }
     return;
+  }
   LLVM_DEBUG({
     schedule.serialize(forOp);
     DBGS() << "Initial coarse schedule:\n" << forOp << "\n";
@@ -384,14 +469,29 @@ void scheduleLoop(scf::ForOp forOp,
 
 /// Schedule the loops based on the latencies assigned to the operations.
 void scheduleLoops(ModuleOp moduleOp) {
+  LDBG("========== STARTING LOOP SCHEDULING ===========");
+  
   DenseMap<Operation *, int> opLatency = deserializeLatencies(moduleOp);
+  LDBG("Deserialized " << opLatency.size() << " operations with latencies");
+  
   SmallVector<scf::ForOp> loops;
   moduleOp->walk([&](scf::ForOp forOp) { loops.push_back(forOp); });
-  if (loops.empty())
+  
+  LDBG("Found " << loops.size() << " loops to potentially schedule");
+  
+  if (loops.empty()) {
+    LDBG("No loops found, returning");
     return;
-  for (auto forOp : loops) {
-    scheduleLoop(forOp, opLatency);
   }
+  
+  int loopIndex = 0;
+  for (auto forOp : loops) {
+    LDBG("\n--- Processing loop " << loopIndex << " ---");
+    scheduleLoop(forOp, opLatency);
+    loopIndex++;
+  }
+  
+  LDBG("========== FINISHED LOOP SCHEDULING ===========");
 }
 
 } // namespace

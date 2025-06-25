@@ -16,6 +16,11 @@
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "llvm/Support/Debug.h"
+
+#define DEBUG_TYPE "triton-loop-pipeline"
+#define DBGS() (llvm::dbgs() << "[" DEBUG_TYPE "]: ")
+#define LDBG(X) LLVM_DEBUG(DBGS() << X << "\n")
+
 //===----------------------------------------------------------------------===//
 // This file will create a schedule that will be handed over to the pipeline
 // expander.
@@ -25,6 +30,11 @@
 // to create async operations and create a modulo schedule. Then we call the
 // expander to generate the prologue and new loop.
 //===----------------------------------------------------------------------===//
+
+using namespace mlir;
+namespace tt = mlir::triton;
+namespace ttg = mlir::triton::gpu;
+namespace ttng = mlir::triton::nvidia_gpu;
 
 namespace mlir {
 namespace triton {
@@ -122,6 +132,8 @@ static bool hasMMAv5WaitsInLastStage(scf::ForOp forOp,
 }
 
 static void expandLoops(ModuleOp moduleOp) {
+  LDBG("========== EXPANDING LOOPS ===========");
+  
   DenseSet<MaskOp> peeledMaskOps;
   auto processPeeledEpilogueOp = [&](RewriterBase &rewriter, Operation *op,
                                      bool isEpilogue) -> Operation * {
@@ -154,14 +166,68 @@ static void expandLoops(ModuleOp moduleOp) {
 
   SmallVector<scf::ForOp> loops;
   moduleOp->walk([&](scf::ForOp forOp) { loops.push_back(forOp); });
+  
+  LDBG("Found " << loops.size() << " loops to expand");
+  
+  int loopIndex = 0;
   for (scf::ForOp forOp : loops) {
+    LDBG("\n--- Expanding loop " << loopIndex << " ---");
+    
     CoarseSchedule schedule;
     if (failed(schedule.deSerialize(forOp))) {
+      LDBG("Failed to deserialize schedule for loop " << loopIndex << ", skipping");
+      
+      // Check if this loop has matrix multiplies
+      bool hasMatrixMultiply = false;
+      for (auto &op : forOp.getBody()->without_terminator()) {
+        if (isa<ttng::MMAv5OpInterface>(op) || isa<ttng::WarpGroupDotOp>(op)) {
+          hasMatrixMultiply = true;
+          break;
+        }
+      }
+      
+      if (!hasMatrixMultiply) {
+        LDBG("*** LOOP WITHOUT MATRIX MULTIPLY FAILED TO EXPAND ***");
+        LDBG("    Reason: Failed to deserialize schedule");
+        LDBG("    Loop operations:");
+        for (auto &op : forOp.getBody()->without_terminator()) {
+          LDBG("      " << op);
+        }
+      }
+      
+      loopIndex++;
       continue;
     }
 
+    LDBG("Successfully deserialized schedule for loop " << loopIndex);
+    LDBG("Schedule has " << schedule.getNumStages() << " stages");
+    
+    // Analyze loop contents
+    bool hasMatrixMultiply = false;
+    bool hasTMALoads = false;
+    bool hasRegularLoads = false;
+    int numOps = 0;
+    
+    for (auto &op : forOp.getBody()->without_terminator()) {
+      numOps++;
+      if (isa<ttng::MMAv5OpInterface>(op) || isa<ttng::WarpGroupDotOp>(op)) {
+        hasMatrixMultiply = true;
+      }
+      if (isa<tt::DescriptorLoadOp, tt::DescriptorGatherOp>(op)) {
+        hasTMALoads = true;
+      }
+      if (isa<tt::LoadOp>(op)) {
+        hasRegularLoads = true;
+      }
+    }
+    
+    LDBG("Loop " << loopIndex << " analysis: numOps=" << numOps << ", hasMatrixMultiply=" << hasMatrixMultiply 
+         << ", hasTMALoads=" << hasTMALoads << ", hasRegularLoads=" << hasRegularLoads);
+    
     std::vector<std::pair<Operation *, unsigned>> finalSchedule =
         schedule.createFinalSchedule(forOp);
+    LDBG("Final schedule has " << finalSchedule.size() << " operations");
+    
     triton::PipeliningOption options;
     options.supportDynamicLoops = true;
     options.peelEpilogue = false;
@@ -194,17 +260,37 @@ static void expandLoops(ModuleOp moduleOp) {
           };
     }
     IRRewriter rewriter(forOp);
+    LDBG("Attempting to pipeline loop " << loopIndex);
     FailureOr<scf::ForOp> newForOp =
         triton::pipelineForLoop(rewriter, forOp, options);
 
     if (failed(newForOp)) {
+      LDBG("Failed to pipeline loop " << loopIndex);
+      
+      if (!hasMatrixMultiply) {
+        LDBG("*** LOOP WITHOUT MATRIX MULTIPLY FAILED TO PIPELINE ***");
+        LDBG("    Reason: pipelineForLoop failed");
+        LDBG("    Loop had " << schedule.getNumStages() << " stages");
+        LDBG("    Loop operations:");
+        for (auto &op : forOp.getBody()->without_terminator()) {
+          LDBG("      " << op);
+        }
+      }
+      
+      loopIndex++;
       continue;
     }
+    LDBG("Successfully pipelined loop " << loopIndex);
     forOp = *newForOp;
     if (customEpiloguePeeling) {
+      LDBG("Applying custom epilogue peeling for loop " << loopIndex);
       mlir::triton::peelLoopEpilogue(forOp, processPeeledEpilogueOp);
     }
+    
+    loopIndex++;
   }
+  
+  LDBG("========== FINISHED EXPANDING LOOPS ===========");
   assert(moduleOp.getOps<triton::gpu::PredicateStageOp>().empty() &&
          "PredicateStageOp should be resolved after the pipeline expansion");
   resolveMaskOp(moduleOp, peeledMaskOps);
@@ -223,9 +309,38 @@ struct PipelinePass : public impl::TritonGPUPipelineBase<PipelinePass> {
   using impl::TritonGPUPipelineBase<PipelinePass>::TritonGPUPipelineBase;
 
   void runOnOperation() override {
+    LDBG("========== STARTING SOFTWARE PIPELINER PASS ===========");
+    
     ModuleOp moduleOp = getOperation();
+    
+    // Count and analyze all loops before pipelining
+    int totalLoops = 0;
+    int loopsWithMatrixMultiply = 0;
+    int loopsWithoutMatrixMultiply = 0;
+    
+    moduleOp->walk([&](scf::ForOp forOp) {
+      totalLoops++;
+      bool hasMatrixMultiply = false;
+      for (auto &op : forOp.getBody()->without_terminator()) {
+        if (isa<ttng::MMAv5OpInterface>(op) || isa<ttng::WarpGroupDotOp>(op)) {
+          hasMatrixMultiply = true;
+          break;
+        }
+      }
+      if (hasMatrixMultiply) {
+        loopsWithMatrixMultiply++;
+      } else {
+        loopsWithoutMatrixMultiply++;
+      }
+    });
+    
+    LDBG("Total loops: " << totalLoops);
+    LDBG("Loops with matrix multiply: " << loopsWithMatrixMultiply);
+    LDBG("Loops without matrix multiply: " << loopsWithoutMatrixMultiply);
+    
     // Transform the loop by introducing async operations to prepare it for
     // pipeline expansion.
+    LDBG("\n=== PHASE 1: LOWER LOOPS ===");
     lowerLoops(moduleOp);
     if (dumpIntermediateSteps) {
       llvm::dbgs()
@@ -234,6 +349,7 @@ struct PipelinePass : public impl::TritonGPUPipelineBase<PipelinePass> {
     }
 
     // Apply the pipeline expansion.
+    LDBG("\n=== PHASE 2: EXPAND LOOPS ===");
     expandLoops(moduleOp);
     if (dumpIntermediateSteps) {
       llvm::dbgs() << "// -----// SoftwarePipeliner internal IR Dump After: "
