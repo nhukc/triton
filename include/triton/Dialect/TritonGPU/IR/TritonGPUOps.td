@@ -417,19 +417,25 @@ def TTG_LocalScatterOp : TTG_Op<"local_scatter"> {
     where the axis dimension is replaced by the index value.
 
     This is the inverse of local_gather and writes to shared memory at runtime-computed indices.
+
+    The `disjoint_group` attribute allows marking groups of scatters that are known not to
+    overlap. Scatters with the same non-zero `disjoint_group` value will not have barriers
+    inserted between them. A value of 0 (default) means the scatter is not part of any
+    disjoint group and will use normal barrier insertion logic.
   }];
   let arguments = (ins
     Arg<TTG_MemDescType, "", [MemWrite<SharedMemory>]>:$dst,
     TT_Tensor:$values,
     TT_IntTensor:$indices,
     I32Attr:$axis,
-    Optional<TTG_AsyncToken>:$token
+    Optional<TTG_AsyncToken>:$token,
+    DefaultValuedAttr<I32Attr, "0">:$disjoint_group
   );
 
   let builders = [
       OpBuilder<(ins "Value":$dst, "Value":$values, "Value":$indices, "IntegerAttr":$axis),
       [{
-      build($_builder, $_state, dst, values, indices, axis, /*token=*/static_cast<mlir::Value>(nullptr));
+      build($_builder, $_state, dst, values, indices, axis, /*token=*/static_cast<mlir::Value>(nullptr), /*disjoint_group=*/$_builder.getI32IntegerAttr(0));
       }]>];
 
   // Use qualified() otherwise "!ttg.memdesc<X>" is printed as "<X>".

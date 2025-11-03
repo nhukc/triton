@@ -289,7 +289,7 @@ class GluonSemantic(TritonSemantic[TensorTy]):
         handle = self.builder.create_local_gather(ret_ty.to_ir(self.builder), mem_desc.handle, indices.handle, axis)
         return ttgl.tensor(handle, ret_ty)
 
-    def shared_scatter(self, mem_desc, indices, axis, values):
+    def shared_scatter(self, mem_desc, indices, axis, values, disjoint_group=None):
         _check(isinstance(indices, ttgl.tensor),
                lambda: f"expected 'indices' to be a tensor, but got a {type(indices)}")
         _check(isinstance(axis, int), lambda: f"expected 'axis' to be an int, but got a {type(axis)}")
@@ -305,8 +305,11 @@ class GluonSemantic(TritonSemantic[TensorTy]):
         _check(
             values.dtype == mem_desc.dtype,
             lambda: f"values element type must match destination element type: got {values.dtype} and {mem_desc.dtype}")
+        if disjoint_group is not None:
+            _check(isinstance(disjoint_group, int) and disjoint_group >= 0,
+                   lambda: f"expected 'disjoint_group' to be a non-negative int, but got {disjoint_group}")
 
-        self.builder.create_local_scatter(mem_desc.handle, values.handle, indices.handle, axis)
+        self.builder.create_local_scatter(mem_desc.handle, values.handle, indices.handle, axis, disjoint_group)
 
     def bank_conflicts(self, distr_ty, shared_ty):
         if not isinstance(distr_ty, ttgl.distributed_type):

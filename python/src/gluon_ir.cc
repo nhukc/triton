@@ -589,13 +589,17 @@ void init_gluon_ir(py::module &&m) {
            })
       .def("create_local_scatter",
            [](GluonOpBuilder &self, Value memDesc, Value values, Value indices,
-              int32_t axis) {
+              int32_t axis, std::optional<int32_t> disjointGroup) {
              auto ctx = self.getContext();
              auto i32Ty = IntegerType::get(ctx, 32);
              auto axisAttr = IntegerAttr::get(i32Ty, axis);
-             self.create<ttg::LocalScatterOp>(memDesc, values, indices,
+             auto disjointGroupAttr = IntegerAttr::get(i32Ty, disjointGroup.value_or(0));
+             auto scatterOp = self.create<ttg::LocalScatterOp>(memDesc, values, indices,
                                               axisAttr);
-           })
+             scatterOp->setAttr("disjoint_group", disjointGroupAttr);
+           },
+           py::arg("memDesc"), py::arg("values"), py::arg("indices"),
+           py::arg("axis"), py::arg("disjoint_group") = py::none())
       .def("get_shared_bank_conflicts",
            [](GluonOpBuilder &self, Attribute regLayoutAttr,
               Attribute sharedLayoutAttr, std::vector<int64_t> &shape,

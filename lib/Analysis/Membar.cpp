@@ -225,6 +225,27 @@ void MembarAnalysis::update(Operation *op, BlockInfo *blockInfo,
     scratchBufferId = allocation->getBufferId(op);
   }
 
+  // Helper lambda to check if two operations are in the same disjoint group
+  auto inSameDisjointGroup = [](Operation *op1, Operation *op2) -> bool {
+    auto scatter1 = dyn_cast<triton::gpu::LocalScatterOp>(op1);
+    auto scatter2 = dyn_cast<triton::gpu::LocalScatterOp>(op2);
+    if (!scatter1 || !scatter2)
+      return false;
+
+    int32_t group1 = scatter1.getDisjointGroup();
+    int32_t group2 = scatter2.getDisjointGroup();
+
+    // Only treat as disjoint if both are in the same non-zero group
+    return group1 != 0 && group1 == group2;
+  };
+
+  // Create a custom filter that allows same disjoint group scatters to skip barriers
+  auto disjointGroupFilter = [&](Operation *lhs, Operation *rhs) -> bool {
+    if (filter && filter(lhs, rhs))
+      return true;
+    return inSameDisjointGroup(lhs, rhs);
+  };
+
   // Scratch buffer operations consist of a series of shared memory operations
   // starting from a shared memory write, followed by a series of shared memory
   // read/write operations, and ending with a shared memory read, i.e., shared
@@ -251,7 +272,7 @@ void MembarAnalysis::update(Operation *op, BlockInfo *blockInfo,
     }
     auto interval = allocation->getAllocatedInterval(scratchBufferId);
     curBlockInfo.syncWriteIntervals[interval].insert(op);
-    auto insertCTABarrier = blockInfo->isIntersected(curBlockInfo, filter);
+    auto insertCTABarrier = blockInfo->isIntersected(curBlockInfo, disjointGroupFilter);
     if (insertCTABarrier) {
       builder->setInsertionPoint(op);
       insertBarrier(op, builder);
@@ -261,7 +282,7 @@ void MembarAnalysis::update(Operation *op, BlockInfo *blockInfo,
     if (insertCTABarrier || !isWarpSync)
       blockInfo->sync();
     curBlockInfo.syncReadIntervals[interval].insert(op);
-  } else if (blockInfo->isIntersected(curBlockInfo, filter)) {
+  } else if (blockInfo->isIntersected(curBlockInfo, disjointGroupFilter)) {
     builder->setInsertionPoint(op);
     insertBarrier(op, builder);
     blockInfo->sync();

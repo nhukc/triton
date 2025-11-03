@@ -290,7 +290,7 @@ class shared_memory_descriptor(base_value):
         return _semantic.shared_gather(self, indices, axis)
 
     @builtin
-    def scatter(self, indices, axis, values, _semantic: GluonSemantic = None):
+    def scatter(self, indices, axis, values, disjoint_group=None, _semantic: GluonSemantic = None):
         """
         Scatter elements to shared memory along a specified axis using an indices tensor.
 
@@ -302,11 +302,15 @@ class shared_memory_descriptor(base_value):
             indices (tensor): Tensor specifying which indices to scatter to along the axis.
             axis (int): The axis along which to scatter values.
             values (tensor): Tensor with values to scatter (same shape as indices).
+            disjoint_group (int, optional): Disjoint group ID. Scatters with the same non-zero
+                disjoint_group are guaranteed not to overlap and will not have barriers inserted
+                between them. Default is None (equivalent to 0), meaning normal barrier insertion.
         """
         indices = _unwrap_if_constexpr(indices)
         axis = _unwrap_if_constexpr(axis)
         values = _unwrap_if_constexpr(values)
-        return _semantic.shared_scatter(self, indices, axis, values)
+        disjoint_group = _unwrap_if_constexpr(disjoint_group) if disjoint_group is not None else None
+        return _semantic.shared_scatter(self, indices, axis, values, disjoint_group)
 
     def slice(self, start, length, dim=0, _semantic: GluonSemantic = None) -> shared_memory_descriptor:
         """
