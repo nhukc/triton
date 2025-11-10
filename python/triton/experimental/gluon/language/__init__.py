@@ -79,6 +79,7 @@ from ._core import (
     to_linear_layout,
     to_tensor,
     warp_specialize,
+    warp_specialize_pipeline,
     where,
 )
 from ._layouts import (

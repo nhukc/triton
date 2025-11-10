@@ -528,6 +528,19 @@ class CodeGenerator(ast.NodeVisitor):
         elts = language.tuple([self.visit(elt) for elt in node.elts])
         return elts
 
+    def visit_Dict(self, node):
+        # Dict literals are converted to Python dicts wrapped in constexpr
+        # This allows them to be used at compile-time for pipeline specs, etc.
+        keys = [self.visit(k) for k in node.keys]
+        values = [self.visit(v) for v in node.values]
+        # Unwrap constexpr values to build a plain Python dict
+        result = {}
+        for k, v in zip(keys, values):
+            key = _unwrap_if_constexpr(k)
+            val = _unwrap_if_constexpr(v)
+            result[key] = val
+        return constexpr(result)
+
     def visit_ListComp(self, node: ast.ListComp):
         if len(node.generators) != 1:
             raise ValueError("nested comprehensions are not supported")

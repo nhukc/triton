@@ -559,6 +559,40 @@ def warp_specialize(functions_and_args, worker_num_warps, worker_num_regs, _sema
 
 
 @builtin
+def warp_specialize_pipeline(channels, stages, num_iters, default_stage, _semantic=None, _generator=None):
+    """
+    Create a warp-specialized pipeline with automatic barrier synchronization.
+
+    This is a higher-level wrapper around warp_specialize that automatically handles:
+    - Allocation of shared memory buffers for channels
+    - Allocation and initialization of barriers
+    - Generation of partition functions with proper synchronization
+    - Orchestration via warp_specialize
+
+    Args:
+        channels (dict): Channel specifications. Each channel is a tuple of:
+            (num_buffers, shapes, dtypes, layouts)
+            where shapes/dtypes/layouts are lists (one per tensor in the bundle).
+            Example: {"ab": (2, [[32,64], [32,64]], [float32, float32], [layout1, layout2])}
+
+        stages (list): List of stage specifications. Each stage is a tuple of:
+            (name, function, inputs, outputs, num_warps, num_regs, static_args)
+            where inputs/outputs are lists of channel names, and static_args is a tuple
+            of additional arguments to pass to the function.
+            The function signature should be: (input_bufs..., output_bufs..., iter_idx, *static_args)
+            Example: [("load", load_fn, [], ["ab"], 1, 24, (ptr, offset))]
+
+        num_iters (int): Number of iterations for all stages to execute (runtime value).
+
+        default_stage (str): Name of the stage to use as the default partition.
+
+    Returns:
+        Results from the default partition (if any).
+    """
+    return _semantic.warp_specialize_pipeline(channels, stages, num_iters, default_stage, _generator)
+
+
+@builtin
 def num_warps(_semantic=None, _generator=None):
     """
     Returns the number of warps that execute the current context, including in warp-specialized regions.
