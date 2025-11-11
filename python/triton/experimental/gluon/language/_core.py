@@ -558,38 +558,45 @@ def warp_specialize(functions_and_args, worker_num_warps, worker_num_regs, _sema
     return _semantic.warp_specialize(functions_and_args, worker_num_warps, worker_num_regs, _generator)
 
 
-@builtin
-def warp_specialize_pipeline(channels, stages, num_iters, default_stage, _semantic=None, _generator=None):
-    """
-    Create a warp-specialized pipeline with automatic barrier synchronization.
 
-    This is a higher-level wrapper around warp_specialize that automatically handles:
-    - Allocation of shared memory buffers for channels
-    - Allocation and initialization of barriers
-    - Generation of partition functions with proper synchronization
-    - Orchestration via warp_specialize
+
+@builtin
+def create_channel(num_buffers, shapes, dtypes, layouts, _semantic=None):
+    """
+    Create a multi-buffered channel for producer-consumer communication.
 
     Args:
-        channels (dict): Channel specifications. Each channel is a tuple of:
-            (num_buffers, shapes, dtypes, layouts)
-            where shapes/dtypes/layouts are lists (one per tensor in the bundle).
-            Example: {"ab": (2, [[32,64], [32,64]], [float32, float32], [layout1, layout2])}
-
-        stages (list): List of stage specifications. Each stage is a tuple of:
-            (name, function, inputs, outputs, num_warps, num_regs, static_args)
-            where inputs/outputs are lists of channel names, and static_args is a tuple
-            of additional arguments to pass to the function.
-            The function signature should be: (input_bufs..., output_bufs..., iter_idx, *static_args)
-            Example: [("load", load_fn, [], ["ab"], 1, 24, (ptr, offset))]
-
-        num_iters (int): Number of iterations for all stages to execute (runtime value).
-
-        default_stage (str): Name of the stage to use as the default partition.
+        num_buffers (int): Number of buffers in the circular queue
+        shapes (List[List[int]]): List of tensor shapes (one per tensor in the bundle)
+        dtypes (List[dtype]): List of dtypes (one per tensor)
+        layouts (List[SharedLayout]): List of SharedLayouts (one per tensor)
 
     Returns:
-        Results from the default partition (if any).
+        Tuple of (sender, receiver) handles
+
+    Example:
+        sender, receiver = ttgl.create_channel(
+            num_buffers=2,
+            shapes=[[128, 128]],
+            dtypes=[ttgl.float16],
+            layouts=[shared_layout]
+        )
+
+        # Sender side (producer warp)
+        bufs = sender.allocate()
+        # ... populate bufs[0] ...
+        sender.send(bufs)
+
+        # Receiver side (consumer warp)
+        bufs = receiver.recv()
+        # ... use bufs[0] ...
+        receiver.free(bufs)
     """
-    return _semantic.warp_specialize_pipeline(channels, stages, num_iters, default_stage, _generator)
+    num_buffers = _unwrap_if_constexpr(num_buffers)
+    shapes = [[_unwrap_if_constexpr(s) for s in shape] for shape in shapes]
+    dtypes = [_unwrap_if_constexpr(dtype) for dtype in dtypes]
+    layouts = [_unwrap_if_constexpr(layout) for layout in layouts]
+    return _semantic.create_channel(num_buffers, shapes, dtypes, layouts)
 
 
 @builtin

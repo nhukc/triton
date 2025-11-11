@@ -99,6 +99,375 @@ class GluonCallerContext:
         fn.set_attr("ttg.num-warps", builder.get_int32_attr(self.num_warps))
 
 
+class Channel:
+    """Multi-buffered channel for producer-consumer communication.
+
+    This class only stores the shared buffers and barriers.
+    Each sender/receiver maintains its own counter.
+    """
+
+    def __init__(self, semantic, num_buffers, shapes, dtypes, layouts):
+        self.semantic = semantic
+        self.num_buffers = num_buffers
+        self.shapes = shapes
+        self.dtypes = dtypes
+        self.layouts = layouts
+
+        # Allocate buffers for each tensor in the bundle
+        self.buffers = []
+        for shape, dtype, layout in zip(shapes, dtypes, layouts):
+            full_shape = [num_buffers] + list(shape)
+            buf = semantic.allocate_shared(dtype, full_shape, layout, None)
+            self.buffers.append(buf)
+
+        # Allocate barriers using hopper mbarrier
+        from triton.experimental.gluon.language.nvidia.hopper.mbarrier import MBarrierLayout
+        bar_layout = MBarrierLayout()
+        self.empty_barriers = semantic.allocate_shared(ttgl.int64, [num_buffers, 1], bar_layout, None)
+        self.ready_barriers = semantic.allocate_shared(ttgl.int64, [num_buffers, 1], bar_layout, None)
+
+        # Initialize barriers
+        for i in range(num_buffers):
+            empty_idx = semantic.memdesc_index(self.empty_barriers, ttgl.constexpr(i))
+            ready_idx = semantic.memdesc_index(self.ready_barriers, ttgl.constexpr(i))
+            semantic.builder.create_mbarrier_init(empty_idx.handle, 1)
+            semantic.builder.create_mbarrier_init(ready_idx.handle, 1)
+
+    def sender(self):
+        return ChannelSender(self)
+
+    def receiver(self):
+        return ChannelReceiver(self)
+
+
+class ChannelSenderType(ttgl.base_type):
+    """Type for ChannelSender."""
+
+    def __init__(self, num_buffers, shapes, dtypes, layouts, buffer_types, barrier_types):
+        self.num_buffers = num_buffers
+        self.shapes = shapes
+        self.dtypes = dtypes
+        self.layouts = layouts
+        self.buffer_types = buffer_types
+        self.barrier_types = barrier_types
+
+    def __eq__(self, other):
+        return (type(self) is type(other) and
+                self.num_buffers == other.num_buffers and
+                self.buffer_types == other.buffer_types and
+                self.barrier_types == other.barrier_types)
+
+    def mangle(self):
+        """Generate a unique type signature for this channel sender."""
+        buf_mangles = "_".join(t.mangle() for t in self.buffer_types)
+        bar_mangles = "_".join(t.mangle() for t in self.barrier_types)
+        return f"ChSnd_{self.num_buffers}_{buf_mangles}_{bar_mangles}"
+
+    def _flatten_ir_types(self, builder, out):
+        """Flatten to IR types by passing all buffer and barrier types."""
+        for buf_type in self.buffer_types:
+            buf_type._flatten_ir_types(builder, out)
+        for bar_type in self.barrier_types:
+            bar_type._flatten_ir_types(builder, out)
+        # Add counter type (int32 scalar)
+        out.append(builder.get_int32_ty())
+
+    def _unflatten_ir(self, handles, cursor):
+        """Reconstruct ChannelSender from IR handles."""
+        # First unflatten all buffers
+        buffers = []
+        for buf_type in self.buffer_types:
+            buf, cursor = buf_type._unflatten_ir(handles, cursor)
+            buffers.append(buf)
+
+        # Then unflatten barriers
+        empty_barriers, cursor = self.barrier_types[0]._unflatten_ir(handles, cursor)
+        ready_barriers, cursor = self.barrier_types[1]._unflatten_ir(handles, cursor)
+
+        # Unflatten counter (it's an int32 scalar)
+        from triton.experimental.gluon.language import int32
+        counter_type = ttgl.tensor([1], int32).type
+        counter, cursor = counter_type._unflatten_ir(handles, cursor)
+
+        # Reconstruct the sender
+        sender = ChannelSender.__new__(ChannelSender)
+        sender.num_buffers = self.num_buffers
+        sender.shapes = self.shapes
+        sender.dtypes = self.dtypes
+        sender.layouts = self.layouts
+        sender.buffers = buffers
+        sender.empty_barriers = empty_barriers
+        sender.ready_barriers = ready_barriers
+        sender.counter = counter
+        sender.type = self
+
+        return sender, cursor
+
+
+class ChannelSender(ttgl.base_value):
+    """Producer side of a channel.
+
+    Maintains its own counter that is only modified by the sender.
+    """
+
+    def __init__(self, channel: Channel):
+        self.num_buffers = channel.num_buffers
+        self.shapes = channel.shapes
+        self.dtypes = channel.dtypes
+        self.layouts = channel.layouts
+        self.buffers = channel.buffers
+        self.empty_barriers = channel.empty_barriers
+        self.ready_barriers = channel.ready_barriers
+
+        # Create the type
+        buffer_types = [buf.type for buf in self.buffers]
+        barrier_types = [channel.empty_barriers.type, channel.ready_barriers.type]
+        self.type = ChannelSenderType(
+            channel.num_buffers, channel.shapes, channel.dtypes, channel.layouts,
+            buffer_types, barrier_types
+        )
+
+        # Counter is an IR tensor that will be updated across calls
+        self.counter = channel.semantic.to_tensor(ttgl.constexpr(0))
+
+    def _flatten_ir(self, handles):
+        """Flatten to IR by passing all buffers and barriers."""
+        # Flatten all buffers
+        for buf in self.buffers:
+            buf._flatten_ir(handles)
+        # Flatten barriers
+        self.empty_barriers._flatten_ir(handles)
+        self.ready_barriers._flatten_ir(handles)
+        # Flatten counter
+        self.counter._flatten_ir(handles)
+
+    @ttgl.builtin
+    def allocate(self, _semantic=None):
+        """Allocate buffer(s) for writing. Waits if all buffers are full.
+        Returns tuple of mem descriptors (one per tensor in the bundle).
+        """
+        semantic = _semantic
+        num_buffers = self.num_buffers
+        counter = self.counter
+
+        # Compute idx = counter % num_buffers
+        num_bufs_tensor = semantic.to_tensor(ttgl.constexpr(num_buffers))
+        idx_tensor = semantic.mod(counter, num_bufs_tensor)
+
+        # Compute phase = (counter // num_buffers) & 1, then XOR with 1 (wait for empty)
+        one_tensor = semantic.to_tensor(ttgl.constexpr(1))
+        div_result = semantic.floordiv(counter, num_bufs_tensor)
+        and_result = semantic.and_(div_result, one_tensor)
+        phase_tensor = semantic.xor_(and_result, one_tensor)
+
+        # Wait for empty barrier
+        empty_idx = semantic.memdesc_index(self.empty_barriers, idx_tensor)
+        pred_tensor = semantic.to_tensor(ttgl.constexpr(True))
+        semantic.builder.create_mbarrier_wait(empty_idx.handle, phase_tensor.handle, pred_tensor.handle, [])
+
+        # Index into each buffer and return
+        result = []
+        for buf in self.buffers:
+            buf_idx = semantic.memdesc_index(buf, idx_tensor)
+            # Attach the index as a Python attribute so send() can use it later
+            buf_idx._channel_index = idx_tensor
+            buf_idx._channel_counter = counter
+            result.append(buf_idx)
+
+        # Increment counter (only sender modifies this)
+        self.counter = semantic.add(counter, one_tensor, sanitize_overflow=False)
+
+        return ttgl.tuple(result)
+
+    @ttgl.builtin
+    def send(self, buffers, _semantic=None):
+        """Signal that buffer(s) are ready for consumption.
+
+        Args:
+            buffers: The buffers returned from allocate()
+        """
+        semantic = _semantic
+
+        # Extract the index from the first buffer (attached in allocate)
+        idx_tensor = buffers[0]._channel_index
+        counter = buffers[0]._channel_counter
+
+        # Compute phase = (counter // num_buffers) & 1 (for ready barrier)
+        num_bufs_tensor = semantic.to_tensor(ttgl.constexpr(self.num_buffers))
+        one_tensor = semantic.to_tensor(ttgl.constexpr(1))
+        div_result = semantic.floordiv(counter, num_bufs_tensor)
+        phase_tensor = semantic.and_(div_result, one_tensor)
+
+        # Signal ready barrier
+        ready_idx = semantic.memdesc_index(self.ready_barriers, idx_tensor)
+        pred_tensor = semantic.to_tensor(ttgl.constexpr(True))
+        semantic.builder.create_fence_async_shared(False)
+        semantic.builder.create_mbarrier_arrive(ready_idx.handle, 1, pred_tensor.handle)
+
+
+class ChannelReceiverType(ttgl.base_type):
+    """Type for ChannelReceiver."""
+
+    def __init__(self, num_buffers, shapes, dtypes, layouts, buffer_types, barrier_types):
+        self.num_buffers = num_buffers
+        self.shapes = shapes
+        self.dtypes = dtypes
+        self.layouts = layouts
+        self.buffer_types = buffer_types
+        self.barrier_types = barrier_types
+
+    def __eq__(self, other):
+        return (type(self) is type(other) and
+                self.num_buffers == other.num_buffers and
+                self.buffer_types == other.buffer_types and
+                self.barrier_types == other.barrier_types)
+
+    def mangle(self):
+        """Generate a unique type signature for this channel receiver."""
+        buf_mangles = "_".join(t.mangle() for t in self.buffer_types)
+        bar_mangles = "_".join(t.mangle() for t in self.barrier_types)
+        return f"ChRcv_{self.num_buffers}_{buf_mangles}_{bar_mangles}"
+
+    def _flatten_ir_types(self, builder, out):
+        """Flatten to IR types by passing all buffer and barrier types."""
+        for buf_type in self.buffer_types:
+            buf_type._flatten_ir_types(builder, out)
+        for bar_type in self.barrier_types:
+            bar_type._flatten_ir_types(builder, out)
+        # Add counter type (int32 tensor)
+        out.append(builder.get_int32_ty())
+
+    def _unflatten_ir(self, handles, cursor):
+        """Reconstruct ChannelReceiver from IR handles."""
+        # First unflatten all buffers
+        buffers = []
+        for buf_type in self.buffer_types:
+            buf, cursor = buf_type._unflatten_ir(handles, cursor)
+            buffers.append(buf)
+
+        # Then unflatten barriers
+        empty_barriers, cursor = self.barrier_types[0]._unflatten_ir(handles, cursor)
+        ready_barriers, cursor = self.barrier_types[1]._unflatten_ir(handles, cursor)
+
+        # Unflatten counter (it's an int32 scalar)
+        from triton.experimental.gluon.language import int32
+        counter_type = ttgl.tensor([1], int32).type
+        counter, cursor = counter_type._unflatten_ir(handles, cursor)
+
+        # Reconstruct the receiver
+        receiver = ChannelReceiver.__new__(ChannelReceiver)
+        receiver.num_buffers = self.num_buffers
+        receiver.shapes = self.shapes
+        receiver.dtypes = self.dtypes
+        receiver.layouts = self.layouts
+        receiver.buffers = buffers
+        receiver.empty_barriers = empty_barriers
+        receiver.ready_barriers = ready_barriers
+        receiver.counter = counter
+        receiver.type = self
+
+        return receiver, cursor
+
+
+class ChannelReceiver(ttgl.base_value):
+    """Consumer side of a channel.
+
+    Maintains its own counter that is only modified by the receiver.
+    """
+
+    def __init__(self, channel: Channel):
+        self.num_buffers = channel.num_buffers
+        self.shapes = channel.shapes
+        self.dtypes = channel.dtypes
+        self.layouts = channel.layouts
+        self.buffers = channel.buffers
+        self.empty_barriers = channel.empty_barriers
+        self.ready_barriers = channel.ready_barriers
+
+        # Create the type
+        buffer_types = [buf.type for buf in self.buffers]
+        barrier_types = [channel.empty_barriers.type, channel.ready_barriers.type]
+        self.type = ChannelReceiverType(
+            channel.num_buffers, channel.shapes, channel.dtypes, channel.layouts,
+            buffer_types, barrier_types
+        )
+
+        # Counter is an IR tensor that will be updated across calls
+        self.counter = channel.semantic.to_tensor(ttgl.constexpr(0))
+
+    def _flatten_ir(self, handles):
+        """Flatten to IR by passing all buffers and barriers."""
+        # Flatten all buffers
+        for buf in self.buffers:
+            buf._flatten_ir(handles)
+        # Flatten barriers
+        self.empty_barriers._flatten_ir(handles)
+        self.ready_barriers._flatten_ir(handles)
+        # Flatten counter
+        self.counter._flatten_ir(handles)
+
+    @ttgl.builtin
+    def recv(self, _semantic=None):
+        """Wait for and receive buffer(s). Returns tuple of mem descriptors."""
+        semantic = _semantic
+        num_buffers = self.num_buffers
+        counter = self.counter
+
+        # Compute idx = counter % num_buffers
+        num_bufs_tensor = semantic.to_tensor(ttgl.constexpr(num_buffers))
+        idx_tensor = semantic.mod(counter, num_bufs_tensor)
+
+        # Compute phase = (counter // num_buffers) & 1 (wait for ready)
+        one_tensor = semantic.to_tensor(ttgl.constexpr(1))
+        div_result = semantic.floordiv(counter, num_bufs_tensor)
+        phase_tensor = semantic.and_(div_result, one_tensor)
+
+        # Wait for ready barrier
+        ready_idx = semantic.memdesc_index(self.ready_barriers, idx_tensor)
+        pred_tensor = semantic.to_tensor(ttgl.constexpr(True))
+        semantic.builder.create_mbarrier_wait(ready_idx.handle, phase_tensor.handle, pred_tensor.handle, [])
+
+        # Index into each buffer and return
+        result = []
+        for buf in self.buffers:
+            buf_idx = semantic.memdesc_index(buf, idx_tensor)
+            # Attach the index as a Python attribute so free() can use it later
+            buf_idx._channel_index = idx_tensor
+            buf_idx._channel_counter = counter
+            result.append(buf_idx)
+
+        # Increment counter (only receiver modifies this)
+        self.counter = semantic.add(counter, one_tensor, sanitize_overflow=False)
+
+        return ttgl.tuple(result)
+
+    @ttgl.builtin
+    def free(self, buffers, _semantic=None):
+        """Signal that buffer(s) have been consumed.
+
+        Args:
+            buffers: The buffers returned from recv()
+        """
+        semantic = _semantic
+
+        # Extract the index from the first buffer (attached in recv)
+        idx_tensor = buffers[0]._channel_index
+        counter = buffers[0]._channel_counter
+
+        # Compute phase = (counter // num_buffers) & 1, then XOR with 1 (for empty barrier)
+        num_bufs_tensor = semantic.to_tensor(ttgl.constexpr(self.num_buffers))
+        one_tensor = semantic.to_tensor(ttgl.constexpr(1))
+        div_result = semantic.floordiv(counter, num_bufs_tensor)
+        and_result = semantic.and_(div_result, one_tensor)
+        phase_tensor = semantic.xor_(and_result, one_tensor)
+
+        # Signal empty barrier
+        empty_idx = semantic.memdesc_index(self.empty_barriers, idx_tensor)
+        pred_tensor = semantic.to_tensor(ttgl.constexpr(True))
+        semantic.builder.create_fence_async_shared(False)
+        semantic.builder.create_mbarrier_arrive(empty_idx.handle, 1, pred_tensor.handle)
+
+
 class _BarrierInsertingBuilder:
     """Wrapper around GluonOpBuilder that inserts barriers after operations."""
 
@@ -134,6 +503,10 @@ class GluonSemantic(TritonSemantic[TensorTy]):
             self.builder = _BarrierInsertingBuilder(builder, self)
         else:
             self.builder = builder
+
+    def to_tensor(self, x, check_type=True):
+        # Delegate to parent for normal handling
+        return super().to_tensor(x, check_type)
 
     def _wrap_handle_infer_layout(self, handle, scalar_ty, shape):
         if shape == []:
@@ -629,477 +1002,23 @@ class GluonSemantic(TritonSemantic[TensorTy]):
             return
         return tuple(unflatten_ir_values(mlir_results, [r.type for r in default_results]))
 
-    def warp_specialize_pipeline(self, channels, stages, num_iters, default_stage, generator):
-        """
-        Implement the pipeline abstraction by directly emitting warp_specialize IR.
 
-        This method:
-        1. Allocates shared memory for all channels
-        2. Initializes barriers
-        3. Emits warp_specialize IR with partition regions containing the pipeline logic
-        """
-        # Unwrap constexpr values
-        channels = ttgl._unwrap_if_constexpr(channels)
-        stages = ttgl._unwrap_if_constexpr(stages)
-        default_stage = ttgl._unwrap_if_constexpr(default_stage)
-
-        # Allocate channel resources
-        channel_bufs = {}
-        channel_empty_bars = {}
-        channel_ready_bars = {}
-
-        for ch_name, ch_spec in channels.items():
-            num_buffers, shapes, dtypes, layouts = ch_spec
-            num_buffers = ttgl._unwrap_if_constexpr(num_buffers)
-
-            # Allocate buffers for each tensor in the bundle
-            bufs = []
-            for shape, dtype, layout in zip(shapes, dtypes, layouts):
-                shape = [ttgl._unwrap_if_constexpr(s) for s in shape]
-                dtype = ttgl._unwrap_if_constexpr(dtype)
-                layout = ttgl._unwrap_if_constexpr(layout)
-                full_shape = [num_buffers] + shape
-                buf = self.allocate_shared(dtype, full_shape, layout, None)
-                bufs.append(buf)
-            channel_bufs[ch_name] = bufs
-
-            # Allocate barriers using hopper mbarrier
-            from triton.experimental.gluon.language.nvidia.hopper.mbarrier import MBarrierLayout
-            bar_layout = MBarrierLayout()
-            channel_empty_bars[ch_name] = self.allocate_shared(ttgl.int64, [num_buffers, 1], bar_layout, None)
-            channel_ready_bars[ch_name] = self.allocate_shared(ttgl.int64, [num_buffers, 1], bar_layout, None)
-
-        # Initialize barriers
-        for ch_name, ch_spec in channels.items():
-            num_buffers = ttgl._unwrap_if_constexpr(ch_spec[0])
-            empty_bars = channel_empty_bars[ch_name]
-            ready_bars = channel_ready_bars[ch_name]
-
-            for i in range(num_buffers):
-                empty_idx = self.memdesc_index(empty_bars, ttgl.constexpr(i))
-                ready_idx = self.memdesc_index(ready_bars, ttgl.constexpr(i))
-                self.builder.create_mbarrier_init(empty_idx.handle, 1)
-                self.builder.create_mbarrier_init(ready_idx.handle, 1)
-
-        # Find default stage index
-        default_idx = next(i for i, s in enumerate(stages) if ttgl._unwrap_if_constexpr(s[0]) == default_stage)
-
-        # Prepare stage info
-        stage_info = []
-        for stage in stages:
-            stage_name, stage_fn, inputs, outputs, num_warps_stage, num_regs, static_args = stage
-            stage_info.append({
-                'name': ttgl._unwrap_if_constexpr(stage_name),
-                'fn': stage_fn,
-                'inputs': [ttgl._unwrap_if_constexpr(inp) for inp in inputs],
-                'outputs': [ttgl._unwrap_if_constexpr(out) for out in outputs],
-                'num_warps': ttgl._unwrap_if_constexpr(num_warps_stage),
-                'num_regs': ttgl._unwrap_if_constexpr(num_regs),
-                'static_args': tuple(ttgl._unwrap_if_constexpr(arg) for arg in static_args)
-            })
-
-        # Reorder stages so default is first
-        if default_idx != 0:
-            stage_info[0], stage_info[default_idx] = stage_info[default_idx], stage_info[0]
-
-        default_info = stage_info[0]
-        worker_info = stage_info[1:]
-        worker_num_warps = [info['num_warps'] for info in worker_info]
-        worker_num_regs = [info['num_regs'] for info in worker_info]
-
-        builder = self.builder
-        insert_pt = builder.get_insertion_point()
-
-        # Convert num_iters to tensor if needed
-        num_iters_tensor = self.to_tensor(num_iters)
-
-        # Collect all buffers, barriers, num_iters, and static args with handles as operands for warp_specialize
-        ws_operands = []
-        ws_operand_types = []
-        for ch_name in channels:
-            for buf in channel_bufs[ch_name]:
-                ws_operands.append(buf.handle)
-                ws_operand_types.append(buf.handle.get_type())
-            ws_operands.append(channel_empty_bars[ch_name].handle)
-            ws_operand_types.append(channel_empty_bars[ch_name].handle.get_type())
-            ws_operands.append(channel_ready_bars[ch_name].handle)
-            ws_operand_types.append(channel_ready_bars[ch_name].handle.get_type())
-
-        # Add num_iters
-        ws_operands.append(num_iters_tensor.handle)
-        ws_operand_types.append(num_iters_tensor.handle.get_type())
-
-        # Collect all unique static args with handles from all stages
-        all_static_args = []
-        seen_handles = set()
-        for stage_info in [default_info] + worker_info:
-            for arg in stage_info['static_args']:
-                if hasattr(arg, 'handle'):
-                    handle_id = id(arg.handle)
-                    if handle_id not in seen_handles:
-                        seen_handles.add(handle_id)
-                        all_static_args.append(arg)
-                        ws_operands.append(arg.handle)
-                        ws_operand_types.append(arg.handle.get_type())
-
-        # Emit the default partition (can implicitly capture)
-        default_block = builder.new_block()
-        builder.set_insertion_point_to_start(default_block)
-        self._emit_partition_loop(default_info, num_iters, channels, channel_bufs,
-                                   channel_empty_bars, channel_ready_bars, generator,
-                                   all_static_args, caller_context=None, isolated_partition_block=None)
-        # Default region must yield back the buffers/barriers
-        builder.create_warp_yield(ws_operands)
-
-        # Create the warp specialize op with buffers/barriers as operands
-        builder.restore_insertion_point(insert_pt)
-        ws_op = builder.create_warp_specialize(ws_operand_types, ws_operands, worker_num_warps)
-        ws_op.get_default_region().push_back(default_block)
-        ws_op.set_requested_registers(worker_num_regs)
-
-        # Emit the worker partition regions (isolated from above)
-        num_partitions = len(worker_info)
-        builder.create_block_with_parent(ws_op.get_partition_op_holder(), [])
-        partitions_op = builder.create_warp_specialize_partitions(num_partitions)
-
-        for i, worker in enumerate(worker_info):
-            caller_context = GluonCallerContext(num_warps=worker['num_warps'])
-            block = builder.create_block_with_parent(partitions_op.get_region(i), ws_operand_types)
-            self._emit_partition_loop(worker, num_iters, channels, channel_bufs,
-                                       channel_empty_bars, channel_ready_bars, generator,
-                                       all_static_args, caller_context, isolated_partition_block=block)
-            builder.create_warp_return()
-
-        builder.set_insertion_point_after(ws_op.get_operation())
-
-    def _emit_partition_loop(self, stage_info, num_iters, channels, channel_bufs,
-                              channel_empty_bars, channel_ready_bars, generator,
-                              all_static_args, caller_context=None, isolated_partition_block=None):
-        """Emit the IR for a partition's loop over iterations.
+    def create_channel(self, num_buffers, shapes, dtypes, layouts):
+        """Create a multi-buffered channel for producer-consumer communication.
 
         Args:
-            isolated_partition_block: For worker partitions (isolated from above), this is the
-                                     block with arguments containing buffers/barriers passed from
-                                     warp_specialize operands. For default partition (implicit capture),
-                                     this is None.
+            num_buffers: Number of buffers in the circular queue
+            shapes: List of tensor shapes (one per tensor in the bundle)
+            dtypes: List of dtypes (one per tensor)
+            layouts: List of SharedLayouts (one per tensor)
+
+        Returns:
+            Tuple of (sender, receiver) handles
         """
-        builder = self.builder
-
-        # For isolated partitions, extract buffers/barriers/static args from block arguments
-        # The arguments are passed in this order: buffers, barriers, then static args
-        if isolated_partition_block is not None:
-            arg_idx = 0
-            partition_channel_bufs = {}
-            partition_channel_empty_bars = {}
-            partition_channel_ready_bars = {}
-
-            # Extract buffers and barriers
-            for ch_name in channels:
-                bufs = []
-                for buf in channel_bufs[ch_name]:
-                    buf_handle = isolated_partition_block.arg(arg_idx)
-                    bufs.append(ttgl.shared_memory_descriptor(
-                        buf_handle,
-                        buf.type.element_ty,
-                        buf.type.shape,
-                        buf.type.layout,
-                        buf.type.alloc_shape
-                    ))
-                    arg_idx += 1
-                partition_channel_bufs[ch_name] = bufs
-
-                empty_bar_handle = isolated_partition_block.arg(arg_idx)
-                partition_channel_empty_bars[ch_name] = ttgl.shared_memory_descriptor(
-                    empty_bar_handle,
-                    channel_empty_bars[ch_name].type.element_ty,
-                    channel_empty_bars[ch_name].type.shape,
-                    channel_empty_bars[ch_name].type.layout,
-                    channel_empty_bars[ch_name].type.alloc_shape
-                )
-                arg_idx += 1
-
-                ready_bar_handle = isolated_partition_block.arg(arg_idx)
-                partition_channel_ready_bars[ch_name] = ttgl.shared_memory_descriptor(
-                    ready_bar_handle,
-                    channel_ready_bars[ch_name].type.element_ty,
-                    channel_ready_bars[ch_name].type.shape,
-                    channel_ready_bars[ch_name].type.layout,
-                    channel_ready_bars[ch_name].type.alloc_shape
-                )
-                arg_idx += 1
-
-            # Extract num_iters
-            partition_num_iters_handle = isolated_partition_block.arg(arg_idx)
-            arg_idx += 1
-
-            # Extract static args - they're passed in the same order as all_static_args
-            # Build a map from original handle id to partition block arg
-            partition_static_args_map = {}
-            for sa in all_static_args:
-                partition_static_args_map[id(sa.handle)] = isolated_partition_block.arg(arg_idx)
-                arg_idx += 1
-
-            # Use partition-local versions
-            channel_bufs = partition_channel_bufs
-            channel_empty_bars = partition_channel_empty_bars
-            channel_ready_bars = partition_channel_ready_bars
-            num_iters = ttgl.tensor(partition_num_iters_handle, ttgl.int32)
-
-        # Emit for loop: for i in range(num_iters)
-        zero = self.to_tensor(ttgl.constexpr(0))
-        one = self.to_tensor(ttgl.constexpr(1))
-        num_iters_tensor = self.to_tensor(num_iters)
-
-        # Extract handles for create_for_op
-        lb = zero.handle
-        ub = num_iters_tensor.handle
-        step = one.handle
-
-        # Collect buffers, barriers, and static args as loop-carried values
-        loop_carried_values = []
-        for ch_name in channels:
-            for buf in channel_bufs[ch_name]:
-                loop_carried_values.append(buf.handle)
-            loop_carried_values.append(channel_empty_bars[ch_name].handle)
-            loop_carried_values.append(channel_ready_bars[ch_name].handle)
-
-        # Add static args that aren't constexpr
-        # For isolated partitions, use the partition block args instead of original handles
-        static_args_values = []
-        for arg in stage_info['static_args']:
-            if hasattr(arg, 'handle'):
-                if isolated_partition_block is not None:
-                    # Use partition block arg
-                    loop_carried_values.append(partition_static_args_map[id(arg.handle)])
-                    # Create a wrapper tensor for the partition arg
-                    partition_arg_tensor = ttgl.tensor(partition_static_args_map[id(arg.handle)], arg.dtype)
-                    static_args_values.append(partition_arg_tensor)
-                else:
-                    loop_carried_values.append(arg.handle)
-                    static_args_values.append(arg)
-            else:
-                static_args_values.append(arg)
-
-        # Create loop with loop-carried values
-        for_op = builder.create_for_op(lb, ub, step, loop_carried_values)
-        loop_body = for_op.get_body(0)
-        builder.set_insertion_point_to_start(loop_body)
-
-        # Get loop iteration variable (first argument of the loop body)
-        iter_var_handle = loop_body.arg(0)
-        iter_var = ttgl.tensor(iter_var_handle, ttgl.int32)
-
-        # Extract buffers and barriers from loop arguments
-        arg_idx = 1
-        loop_channel_bufs = {}
-        loop_channel_empty_bars = {}
-        loop_channel_ready_bars = {}
-        for ch_name in channels:
-            bufs = []
-            for buf in channel_bufs[ch_name]:
-                buf_handle = loop_body.arg(arg_idx)
-                bufs.append(ttgl.shared_memory_descriptor(
-                    buf_handle,
-                    buf.type.element_ty,
-                    buf.type.shape,
-                    buf.type.layout,
-                    buf.type.alloc_shape
-                ))
-                arg_idx += 1
-            loop_channel_bufs[ch_name] = bufs
-
-            empty_bar_handle = loop_body.arg(arg_idx)
-            loop_channel_empty_bars[ch_name] = ttgl.shared_memory_descriptor(
-                empty_bar_handle,
-                channel_empty_bars[ch_name].type.element_ty,
-                channel_empty_bars[ch_name].type.shape,
-                channel_empty_bars[ch_name].type.layout,
-                channel_empty_bars[ch_name].type.alloc_shape
-            )
-            arg_idx += 1
-
-            ready_bar_handle = loop_body.arg(arg_idx)
-            loop_channel_ready_bars[ch_name] = ttgl.shared_memory_descriptor(
-                ready_bar_handle,
-                channel_ready_bars[ch_name].type.element_ty,
-                channel_ready_bars[ch_name].type.shape,
-                channel_ready_bars[ch_name].type.layout,
-                channel_ready_bars[ch_name].type.alloc_shape
-            )
-            arg_idx += 1
-
-        # Extract static args from loop arguments
-        loop_static_args = []
-        for arg in static_args_values:
-            if hasattr(arg, 'handle'):
-                arg_handle = loop_body.arg(arg_idx)
-                loop_static_args.append(ttgl.tensor(arg_handle, arg.dtype))
-                arg_idx += 1
-            else:
-                loop_static_args.append(arg)
-
-        # Update stage_info to use loop versions
-        loop_stage_info = stage_info.copy()
-        loop_stage_info['static_args'] = tuple(loop_static_args)
-
-        # Emit loop body using loop-carried versions
-        self._emit_iteration_body(loop_stage_info, iter_var, channels, loop_channel_bufs,
-                                   loop_channel_empty_bars, loop_channel_ready_bars, generator,
-                                   caller_context)
-
-        # Verify loop body has only one block
-        for_op_region = loop_body.get_parent()
-        assert for_op_region.size() == 1, "Loop body should only have one block"
-
-        # Yield all loop-carried values in the same order they were passed
-        # Only create yield if we have loop-carried values (otherwise it's auto-created)
-        builder.set_insertion_point_to_end(loop_body)
-        yield_values = []
-        for ch_name in channels:
-            for buf in loop_channel_bufs[ch_name]:
-                yield_values.append(buf.handle)
-            yield_values.append(loop_channel_empty_bars[ch_name].handle)
-            yield_values.append(loop_channel_ready_bars[ch_name].handle)
-
-        for arg in loop_static_args:
-            if hasattr(arg, 'handle'):
-                yield_values.append(arg.handle)
-
-        if len(yield_values) > 0:
-            builder.create_yield_op(yield_values)
-
-        builder.set_insertion_point_after(for_op.get_operation())
-
-    def _emit_iteration_body(self, stage_info, iter_var, channels, channel_bufs,
-                              channel_empty_bars, channel_ready_bars, generator,
-                              caller_context):
-        """Emit IR for one iteration: waits, function call, signals."""
-        builder = self.builder
-
-        stage_fn = stage_info['fn']
-        inputs = stage_info['inputs']
-        outputs = stage_info['outputs']
-        static_args = stage_info['static_args']
-
-        # Wait for input channels to be ready
-        for ch_name in inputs:
-            ch_spec = channels[ch_name]
-            ch_num_bufs = ttgl._unwrap_if_constexpr(ch_spec[0])
-
-            # Compute idx = iter_var % ch_num_bufs
-            num_bufs_tensor = self.to_tensor(ttgl.constexpr(ch_num_bufs))
-            idx_tensor = self.mod(iter_var, num_bufs_tensor)
-
-            # Compute phase = (iter_var // ch_num_bufs) & 1
-            one_tensor = self.to_tensor(ttgl.constexpr(1))
-            div_result = self.floordiv(iter_var, num_bufs_tensor)
-            phase_tensor = self.and_(div_result, one_tensor)
-
-            # Index into ready barrier and wait
-            ready_bars = channel_ready_bars[ch_name]
-            ready_idx = self.memdesc_index(ready_bars, idx_tensor)
-            pred_tensor = self.to_tensor(ttgl.constexpr(True))
-            builder.create_mbarrier_wait(ready_idx.handle, phase_tensor.handle, pred_tensor.handle, [])
-
-        # Wait for output channels to be empty
-        for ch_name in outputs:
-            ch_spec = channels[ch_name]
-            ch_num_bufs = ttgl._unwrap_if_constexpr(ch_spec[0])
-
-            # Compute idx = iter_var % ch_num_bufs
-            num_bufs_tensor = self.to_tensor(ttgl.constexpr(ch_num_bufs))
-            idx_tensor = self.mod(iter_var, num_bufs_tensor)
-
-            # Compute phase = (iter_var // ch_num_bufs) & 1, then XOR with 1
-            one_tensor = self.to_tensor(ttgl.constexpr(1))
-            div_result = self.floordiv(iter_var, num_bufs_tensor)
-            and_result = self.and_(div_result, one_tensor)
-            phase_tensor = self.xor_(and_result, one_tensor)
-
-            # Index into empty barrier and wait
-            empty_bars = channel_empty_bars[ch_name]
-            empty_idx = self.memdesc_index(empty_bars, idx_tensor)
-            pred_tensor = self.to_tensor(ttgl.constexpr(True))
-            builder.create_mbarrier_wait(empty_idx.handle, phase_tensor.handle, pred_tensor.handle, [])
-
-        # Build function arguments
-        func_args = []
-
-        # Input buffers (with runtime indexing)
-        for ch_name in inputs:
-            ch_spec = channels[ch_name]
-            ch_num_bufs = ttgl._unwrap_if_constexpr(ch_spec[0])
-
-            # Compute idx = iter_var % ch_num_bufs
-            num_bufs_tensor = self.to_tensor(ttgl.constexpr(ch_num_bufs))
-            idx_tensor = self.mod(iter_var, num_bufs_tensor)
-
-            # Index into each buffer in the channel
-            for buf in channel_bufs[ch_name]:
-                buf_idx = self.memdesc_index(buf, idx_tensor)
-                func_args.append(buf_idx)
-
-        # Output buffers (with runtime indexing)
-        for ch_name in outputs:
-            ch_spec = channels[ch_name]
-            ch_num_bufs = ttgl._unwrap_if_constexpr(ch_spec[0])
-
-            # Compute idx = iter_var % ch_num_bufs
-            num_bufs_tensor = self.to_tensor(ttgl.constexpr(ch_num_bufs))
-            idx_tensor = self.mod(iter_var, num_bufs_tensor)
-
-            # Index into each buffer in the channel
-            for buf in channel_bufs[ch_name]:
-                buf_idx = self.memdesc_index(buf, idx_tensor)
-                func_args.append(buf_idx)
-
-        # Add iteration index
-        func_args.append(iter_var)
-
-        # User-provided static arguments
-        func_args.extend(static_args)
-
-        # Call the stage function
-        if caller_context:
-            generator.call_JitFunction(stage_fn, tuple(func_args), kwargs={}, caller_context=caller_context)
-        else:
-            generator.call_JitFunction(stage_fn, tuple(func_args), kwargs={})
-
-        # Signal inputs consumed (mbarrier arrive on empty barriers)
-        for ch_name in inputs:
-            ch_spec = channels[ch_name]
-            ch_num_bufs = ttgl._unwrap_if_constexpr(ch_spec[0])
-
-            # Compute idx = iter_var % ch_num_bufs
-            num_bufs_tensor = self.to_tensor(ttgl.constexpr(ch_num_bufs))
-            idx_tensor = self.mod(iter_var, num_bufs_tensor)
-
-            # Index into empty barrier
-            empty_bars = channel_empty_bars[ch_name]
-            empty_idx = self.memdesc_index(empty_bars, idx_tensor)
-
-            # Fence and arrive
-            builder.create_fence_async_shared(False)
-            pred_tensor = self.to_tensor(ttgl.constexpr(True))
-            builder.create_mbarrier_arrive(empty_idx.handle, 1, pred_tensor.handle)
-
-        # Signal outputs ready (mbarrier arrive on ready barriers)
-        for ch_name in outputs:
-            ch_spec = channels[ch_name]
-            ch_num_bufs = ttgl._unwrap_if_constexpr(ch_spec[0])
-
-            # Compute idx = iter_var % ch_num_bufs
-            num_bufs_tensor = self.to_tensor(ttgl.constexpr(ch_num_bufs))
-            idx_tensor = self.mod(iter_var, num_bufs_tensor)
-
-            # Index into ready barrier
-            ready_bars = channel_ready_bars[ch_name]
-            ready_idx = self.memdesc_index(ready_bars, idx_tensor)
-
-            # Fence and arrive
-            builder.create_fence_async_shared(False)
-            pred_tensor = self.to_tensor(ttgl.constexpr(True))
-            builder.create_mbarrier_arrive(ready_idx.handle, 1, pred_tensor.handle)
+        channel = Channel(self, num_buffers, shapes, dtypes, layouts)
+        sender = channel.sender()
+        receiver = channel.receiver()
+        return ttgl.tuple([sender, receiver])
 
     def num_warps(self, generator):
         if generator.caller_context is not None:

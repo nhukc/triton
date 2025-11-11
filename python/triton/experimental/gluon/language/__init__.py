@@ -45,6 +45,7 @@ from ._core import (
     atomic_xor,
     bank_conflicts,
     convert_layout,
+    create_channel,
     device_assert,
     device_print,
     dot_fma,
@@ -79,7 +80,6 @@ from ._core import (
     to_linear_layout,
     to_tensor,
     warp_specialize,
-    warp_specialize_pipeline,
     where,
 )
 from ._layouts import (
