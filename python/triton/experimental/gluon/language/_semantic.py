@@ -268,7 +268,7 @@ class ChannelSender(ttgl.base_value):
     @ttgl.builtin
     def allocate(self, _semantic=None):
         """Allocate buffer(s) for writing. Waits if all buffers are full.
-        Returns tuple of mem descriptors (one per tensor in the bundle).
+        Returns (buffers_tuple, updated_sender) to make state change explicit.
         """
         semantic = _semantic
         num_buffers = self.num_buffers
@@ -293,28 +293,44 @@ class ChannelSender(ttgl.base_value):
         result = []
         for buf in self.buffers:
             buf_idx = semantic.memdesc_index(buf, idx_tensor)
-            # Attach the index as a Python attribute so send() can use it later
-            buf_idx._channel_index = idx_tensor
-            buf_idx._channel_counter = counter
             result.append(buf_idx)
 
         # Increment counter (only sender modifies this)
-        self.counter = semantic.add(counter, one_tensor, sanitize_overflow=False)
+        new_counter = semantic.add(counter, one_tensor, sanitize_overflow=False)
 
-        return ttgl.tuple(result)
+        # Append channel metadata as the last two elements of the tuple
+        # This ensures they survive compiler transformations
+        result.append(idx_tensor)
+        result.append(counter)
+
+        # Create updated sender with new counter
+        updated_sender = ChannelSender.__new__(ChannelSender)
+        updated_sender.num_buffers = self.num_buffers
+        updated_sender.shapes = self.shapes
+        updated_sender.dtypes = self.dtypes
+        updated_sender.layouts = self.layouts
+        updated_sender.buffers = self.buffers
+        updated_sender.empty_barriers = self.empty_barriers
+        updated_sender.ready_barriers = self.ready_barriers
+        updated_sender.counter = new_counter
+        updated_sender.type = self.type
+
+        return ttgl.tuple([ttgl.tuple(result), updated_sender])
 
     @ttgl.builtin
     def send(self, buffers, _semantic=None):
         """Signal that buffer(s) are ready for consumption.
 
         Args:
-            buffers: The buffers returned from allocate()
+            buffers: The buffers returned from allocate() - a tuple where the last two elements
+                    are the channel index and counter
         """
         semantic = _semantic
 
-        # Extract the index from the first buffer (attached in allocate)
-        idx_tensor = buffers[0]._channel_index
-        counter = buffers[0]._channel_counter
+        # Extract the channel metadata from the last two elements of the tuple
+        # The tuple structure from allocate() is: [buffer0, buffer1, ..., idx_tensor, counter]
+        idx_tensor = buffers[-2]
+        counter = buffers[-1]
 
         # Compute phase = (counter // num_buffers) & 1 (for ready barrier)
         num_bufs_tensor = semantic.to_tensor(ttgl.constexpr(self.num_buffers))
@@ -432,7 +448,9 @@ class ChannelReceiver(ttgl.base_value):
 
     @ttgl.builtin
     def recv(self, _semantic=None):
-        """Wait for and receive buffer(s). Returns tuple of mem descriptors."""
+        """Wait for and receive buffer(s).
+        Returns (buffers_tuple, updated_receiver) to make state change explicit.
+        """
         semantic = _semantic
         num_buffers = self.num_buffers
         counter = self.counter
@@ -455,28 +473,44 @@ class ChannelReceiver(ttgl.base_value):
         result = []
         for buf in self.buffers:
             buf_idx = semantic.memdesc_index(buf, idx_tensor)
-            # Attach the index as a Python attribute so free() can use it later
-            buf_idx._channel_index = idx_tensor
-            buf_idx._channel_counter = counter
             result.append(buf_idx)
 
         # Increment counter (only receiver modifies this)
-        self.counter = semantic.add(counter, one_tensor, sanitize_overflow=False)
+        new_counter = semantic.add(counter, one_tensor, sanitize_overflow=False)
 
-        return ttgl.tuple(result)
+        # Append channel metadata as the last two elements of the tuple
+        # This ensures they survive compiler transformations
+        result.append(idx_tensor)
+        result.append(counter)
+
+        # Create updated receiver with new counter
+        updated_receiver = ChannelReceiver.__new__(ChannelReceiver)
+        updated_receiver.num_buffers = self.num_buffers
+        updated_receiver.shapes = self.shapes
+        updated_receiver.dtypes = self.dtypes
+        updated_receiver.layouts = self.layouts
+        updated_receiver.buffers = self.buffers
+        updated_receiver.empty_barriers = self.empty_barriers
+        updated_receiver.ready_barriers = self.ready_barriers
+        updated_receiver.counter = new_counter
+        updated_receiver.type = self.type
+
+        return ttgl.tuple([ttgl.tuple(result), updated_receiver])
 
     @ttgl.builtin
     def free(self, buffers, _semantic=None):
         """Signal that buffer(s) have been consumed.
 
         Args:
-            buffers: The buffers returned from recv()
+            buffers: The buffers returned from recv() - a tuple where the last two elements
+                    are the channel index and counter
         """
         semantic = _semantic
 
-        # Extract the index from the first buffer (attached in recv)
-        idx_tensor = buffers[0]._channel_index
-        counter = buffers[0]._channel_counter
+        # Extract the channel metadata from the last two elements of the tuple
+        # The tuple structure from recv() is: [buffer0, buffer1, ..., idx_tensor, counter]
+        idx_tensor = buffers[-2]
+        counter = buffers[-1]
 
         # Compute phase = (counter // num_buffers) & 1, then XOR with 1 (for empty barrier)
         num_bufs_tensor = semantic.to_tensor(ttgl.constexpr(self.num_buffers))
