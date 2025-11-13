@@ -103,6 +103,21 @@ struct PrintOpConversion : public ConvertOpToLLVMPattern<triton::PrintOp> {
     // The Python wrapper munges `prefix` so that it prints nicely (e.g. starts
     // with " " and ends with ": ").
 
+    llvm::errs() << "[PrintOp] printTensor: prefix='" << prefixStr << "' elems.size()=" << elems.size() << "\n";
+
+    // Get thread ID and only print from thread 0
+    auto loc = elems[0].getLoc();
+    Value tid = getThreadId(rewriter, loc);
+    auto zero = rewriter.create<LLVM::ConstantOp>(loc, i32_ty, 0);
+    auto isThread0 = rewriter.create<LLVM::ICmpOp>(
+        loc, LLVM::ICmpPredicate::eq, tid, zero);
+
+    // Create conditional control flow following the pattern from AssertOpToLLVM.cpp
+    // prevBlock -> if (tid == 0) -> printBlock -> contBlock
+    //           \------------------> contBlock
+    auto *printBlock = rewriter.splitBlock(rewriter.getBlock(), rewriter.getInsertionPoint());
+    rewriter.setInsertionPointToStart(printBlock);
+
     Value formatStrValue;
     int formatStrByteCount = 0;
     for (int i = 0; i < elems.size(); i++) {
@@ -125,7 +140,8 @@ struct PrintOpConversion : public ConvertOpToLLVMPattern<triton::PrintOp> {
         os << getFormatSubstr(pid[j]);
         printfOperands.push_back(pid[j]);
       }
-      os << ") ";
+      os << ") tid " << getFormatSubstr(tid) << " ";
+      printfOperands.push_back(tid);
 
       // If `rank` is large enough, we could end up exceeding
       // kMaxPrintfOperands.  In that case, just truncate the index.
@@ -171,6 +187,15 @@ struct PrintOpConversion : public ConvertOpToLLVMPattern<triton::PrintOp> {
                           printfOperands, isSignedOperands);
       }
     }
+
+    // Complete the control flow pattern
+    auto *prevBlock = printBlock->getPrevNode();
+    auto *contBlock = rewriter.splitBlock(printBlock, rewriter.getInsertionPoint());
+    rewriter.setInsertionPointToEnd(printBlock);
+    rewriter.create<LLVM::BrOp>(loc, contBlock);
+    rewriter.setInsertionPointToEnd(prevBlock);
+    rewriter.create<LLVM::CondBrOp>(loc, isThread0, printBlock, contBlock);
+    rewriter.setInsertionPointToStart(contBlock);
   }
 
   std::string getFormatSubstr(Value value, bool hex = false,
