@@ -561,7 +561,7 @@ def warp_specialize(functions_and_args, worker_num_warps, worker_num_regs, _sema
 
 
 @builtin
-def create_channel(num_buffers, shapes, dtypes, layouts, _semantic=None):
+def create_channel(num_buffers, shapes, dtypes, layouts, num_producers=1, num_consumers=1, _semantic=None):
     """
     Create a multi-buffered channel for producer-consumer communication.
 
@@ -570,11 +570,15 @@ def create_channel(num_buffers, shapes, dtypes, layouts, _semantic=None):
         shapes (List[List[int]]): List of tensor shapes (one per tensor in the bundle)
         dtypes (List[dtype]): List of dtypes (one per tensor)
         layouts (List[SharedLayout]): List of SharedLayouts (one per tensor)
+        num_producers (int): Number of producers (default 1)
+        num_consumers (int): Number of consumers (default 1)
 
     Returns:
-        Tuple of (sender, receiver) handles
+        Tuple of (senders, receivers) where:
+        - senders is a single sender if num_producers==1, else a tuple of senders
+        - receivers is a single receiver if num_consumers==1, else a tuple of receivers
 
-    Example:
+    Example (single producer, single consumer):
         sender, receiver = ttgl.create_channel(
             num_buffers=2,
             shapes=[[128, 128]],
@@ -582,21 +586,23 @@ def create_channel(num_buffers, shapes, dtypes, layouts, _semantic=None):
             layouts=[shared_layout]
         )
 
-        # Sender side (producer warp)
-        bufs = sender.allocate()
-        # ... populate bufs[0] ...
-        sender.send(bufs)
-
-        # Receiver side (consumer warp)
-        bufs = receiver.recv()
-        # ... use bufs[0] ...
-        receiver.free(bufs)
+    Example (single producer, two consumers):
+        sender, (receiver0, receiver1) = ttgl.create_channel(
+            num_buffers=4,
+            shapes=[[128, 128]],
+            dtypes=[ttgl.float16],
+            layouts=[shared_layout],
+            num_consumers=2
+        )
+        # receiver0 gets buffers [0, 2], receiver1 gets buffers [1, 3]
     """
     num_buffers = _unwrap_if_constexpr(num_buffers)
     shapes = [[_unwrap_if_constexpr(s) for s in shape] for shape in shapes]
     dtypes = [_unwrap_if_constexpr(dtype) for dtype in dtypes]
     layouts = [_unwrap_if_constexpr(layout) for layout in layouts]
-    return _semantic.create_channel(num_buffers, shapes, dtypes, layouts)
+    num_producers = _unwrap_if_constexpr(num_producers)
+    num_consumers = _unwrap_if_constexpr(num_consumers)
+    return _semantic.create_channel(num_buffers, shapes, dtypes, layouts, num_producers, num_consumers)
 
 
 @builtin

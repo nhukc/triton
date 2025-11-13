@@ -104,14 +104,20 @@ class Channel:
 
     This class only stores the shared buffers and barriers.
     Each sender/receiver maintains its own counter.
+
+    Supports multiple producers and/or multiple consumers:
+    - Multiple producers: each producer gets buffers at (counter * num_producers + producer_id) % num_buffers
+    - Multiple consumers: each consumer gets buffers at (counter * num_consumers + consumer_id) % num_buffers
     """
 
-    def __init__(self, semantic, num_buffers, shapes, dtypes, layouts):
+    def __init__(self, semantic, num_buffers, shapes, dtypes, layouts, num_producers, num_consumers):
         self.semantic = semantic
         self.num_buffers = num_buffers
         self.shapes = shapes
         self.dtypes = dtypes
         self.layouts = layouts
+        self.num_producers = num_producers
+        self.num_consumers = num_consumers
 
         # Allocate buffers for each tensor in the bundle
         self.buffers = []
@@ -157,35 +163,39 @@ class Channel:
             semantic.builder.create_mbarrier_init(empty_idx.handle, 1)
             semantic.builder.create_mbarrier_init(ready_idx.handle, 1)
 
-    def sender(self):
-        return ChannelSender(self)
+    def sender(self, producer_id=0):
+        return ChannelSender(self, producer_id)
 
-    def receiver(self):
-        return ChannelReceiver(self)
+    def receiver(self, consumer_id=0):
+        return ChannelReceiver(self, consumer_id)
 
 
 class ChannelSenderType(ttgl.base_type):
     """Type for ChannelSender."""
 
-    def __init__(self, num_buffers, shapes, dtypes, layouts, buffer_types, barrier_types):
+    def __init__(self, num_buffers, shapes, dtypes, layouts, buffer_types, barrier_types, num_producers, producer_id):
         self.num_buffers = num_buffers
         self.shapes = shapes
         self.dtypes = dtypes
         self.layouts = layouts
         self.buffer_types = buffer_types
         self.barrier_types = barrier_types
+        self.num_producers = num_producers
+        self.producer_id = producer_id
 
     def __eq__(self, other):
         return (type(self) is type(other) and
                 self.num_buffers == other.num_buffers and
                 self.buffer_types == other.buffer_types and
-                self.barrier_types == other.barrier_types)
+                self.barrier_types == other.barrier_types and
+                self.num_producers == other.num_producers and
+                self.producer_id == other.producer_id)
 
     def mangle(self):
         """Generate a unique type signature for this channel sender."""
         buf_mangles = "_".join(t.mangle() for t in self.buffer_types)
         bar_mangles = "_".join(t.mangle() for t in self.barrier_types)
-        return f"ChSnd_{self.num_buffers}_{buf_mangles}_{bar_mangles}"
+        return f"ChSnd_{self.num_buffers}_P{self.num_producers}_{self.producer_id}_{buf_mangles}_{bar_mangles}"
 
     def _flatten_ir_types(self, builder, out):
         """Flatten to IR types by passing all buffer and barrier types."""
@@ -223,6 +233,8 @@ class ChannelSenderType(ttgl.base_type):
         sender.empty_barriers = empty_barriers
         sender.ready_barriers = ready_barriers
         sender.counter = counter
+        sender.num_producers = self.num_producers
+        sender.producer_id = self.producer_id
         sender.type = self
 
         return sender, cursor
@@ -234,7 +246,7 @@ class ChannelSender(ttgl.base_value):
     Maintains its own counter that is only modified by the sender.
     """
 
-    def __init__(self, channel: Channel):
+    def __init__(self, channel: Channel, producer_id: int):
         self.num_buffers = channel.num_buffers
         self.shapes = channel.shapes
         self.dtypes = channel.dtypes
@@ -242,13 +254,15 @@ class ChannelSender(ttgl.base_value):
         self.buffers = channel.buffers
         self.empty_barriers = channel.empty_barriers
         self.ready_barriers = channel.ready_barriers
+        self.num_producers = channel.num_producers
+        self.producer_id = producer_id
 
         # Create the type
         buffer_types = [buf.type for buf in self.buffers]
         barrier_types = [channel.empty_barriers.type, channel.ready_barriers.type]
         self.type = ChannelSenderType(
             channel.num_buffers, channel.shapes, channel.dtypes, channel.layouts,
-            buffer_types, barrier_types
+            buffer_types, barrier_types, channel.num_producers, producer_id
         )
 
         # Counter is an IR tensor that will be updated across calls
@@ -274,13 +288,21 @@ class ChannelSender(ttgl.base_value):
         num_buffers = self.num_buffers
         counter = self.counter
 
-        # Compute idx = counter % num_buffers
+        # Compute idx = (counter * num_producers + producer_id) % num_buffers
         num_bufs_tensor = semantic.to_tensor(ttgl.constexpr(num_buffers))
-        idx_tensor = semantic.mod(counter, num_bufs_tensor)
+        num_prods_tensor = semantic.to_tensor(ttgl.constexpr(self.num_producers))
+        prod_id_tensor = semantic.to_tensor(ttgl.constexpr(self.producer_id))
 
-        # Compute phase = (counter // num_buffers) & 1, then XOR with 1 (wait for empty)
+        temp = semantic.mul(counter, num_prods_tensor, sanitize_overflow=False)
+        temp = semantic.add(temp, prod_id_tensor, sanitize_overflow=False)
+        idx_tensor = semantic.mod(temp, num_bufs_tensor)
+
+        # Compute phase = (counter // (num_buffers // num_producers)) & 1, then XOR with 1 (wait for empty)
+        # Each producer revisits the same buffer slot every (num_buffers // num_producers) increments
         one_tensor = semantic.to_tensor(ttgl.constexpr(1))
-        div_result = semantic.floordiv(counter, num_bufs_tensor)
+        buffers_per_producer = num_buffers // self.num_producers
+        bufs_per_prod_tensor = semantic.to_tensor(ttgl.constexpr(buffers_per_producer))
+        div_result = semantic.floordiv(counter, bufs_per_prod_tensor)
         and_result = semantic.and_(div_result, one_tensor)
         phase_tensor = semantic.xor_(and_result, one_tensor)
 
@@ -312,6 +334,8 @@ class ChannelSender(ttgl.base_value):
         updated_sender.buffers = self.buffers
         updated_sender.empty_barriers = self.empty_barriers
         updated_sender.ready_barriers = self.ready_barriers
+        updated_sender.num_producers = self.num_producers
+        updated_sender.producer_id = self.producer_id
         updated_sender.counter = new_counter
         updated_sender.type = self.type
 
@@ -332,10 +356,12 @@ class ChannelSender(ttgl.base_value):
         idx_tensor = buffers[-2]
         counter = buffers[-1]
 
-        # Compute phase = (counter // num_buffers) & 1 (for ready barrier)
+        # Compute phase = (counter // (num_buffers // num_producers)) & 1 (for ready barrier)
         num_bufs_tensor = semantic.to_tensor(ttgl.constexpr(self.num_buffers))
         one_tensor = semantic.to_tensor(ttgl.constexpr(1))
-        div_result = semantic.floordiv(counter, num_bufs_tensor)
+        buffers_per_producer = self.num_buffers // self.num_producers
+        bufs_per_prod_tensor = semantic.to_tensor(ttgl.constexpr(buffers_per_producer))
+        div_result = semantic.floordiv(counter, bufs_per_prod_tensor)
         phase_tensor = semantic.and_(div_result, one_tensor)
 
         # Signal ready barrier
@@ -348,25 +374,29 @@ class ChannelSender(ttgl.base_value):
 class ChannelReceiverType(ttgl.base_type):
     """Type for ChannelReceiver."""
 
-    def __init__(self, num_buffers, shapes, dtypes, layouts, buffer_types, barrier_types):
+    def __init__(self, num_buffers, shapes, dtypes, layouts, buffer_types, barrier_types, num_consumers, consumer_id):
         self.num_buffers = num_buffers
         self.shapes = shapes
         self.dtypes = dtypes
         self.layouts = layouts
         self.buffer_types = buffer_types
         self.barrier_types = barrier_types
+        self.num_consumers = num_consumers
+        self.consumer_id = consumer_id
 
     def __eq__(self, other):
         return (type(self) is type(other) and
                 self.num_buffers == other.num_buffers and
                 self.buffer_types == other.buffer_types and
-                self.barrier_types == other.barrier_types)
+                self.barrier_types == other.barrier_types and
+                self.num_consumers == other.num_consumers and
+                self.consumer_id == other.consumer_id)
 
     def mangle(self):
         """Generate a unique type signature for this channel receiver."""
         buf_mangles = "_".join(t.mangle() for t in self.buffer_types)
         bar_mangles = "_".join(t.mangle() for t in self.barrier_types)
-        return f"ChRcv_{self.num_buffers}_{buf_mangles}_{bar_mangles}"
+        return f"ChRcv_{self.num_buffers}_C{self.num_consumers}_{self.consumer_id}_{buf_mangles}_{bar_mangles}"
 
     def _flatten_ir_types(self, builder, out):
         """Flatten to IR types by passing all buffer and barrier types."""
@@ -404,6 +434,8 @@ class ChannelReceiverType(ttgl.base_type):
         receiver.empty_barriers = empty_barriers
         receiver.ready_barriers = ready_barriers
         receiver.counter = counter
+        receiver.num_consumers = self.num_consumers
+        receiver.consumer_id = self.consumer_id
         receiver.type = self
 
         return receiver, cursor
@@ -415,7 +447,7 @@ class ChannelReceiver(ttgl.base_value):
     Maintains its own counter that is only modified by the receiver.
     """
 
-    def __init__(self, channel: Channel):
+    def __init__(self, channel: Channel, consumer_id: int):
         self.num_buffers = channel.num_buffers
         self.shapes = channel.shapes
         self.dtypes = channel.dtypes
@@ -423,13 +455,15 @@ class ChannelReceiver(ttgl.base_value):
         self.buffers = channel.buffers
         self.empty_barriers = channel.empty_barriers
         self.ready_barriers = channel.ready_barriers
+        self.num_consumers = channel.num_consumers
+        self.consumer_id = consumer_id
 
         # Create the type
         buffer_types = [buf.type for buf in self.buffers]
         barrier_types = [channel.empty_barriers.type, channel.ready_barriers.type]
         self.type = ChannelReceiverType(
             channel.num_buffers, channel.shapes, channel.dtypes, channel.layouts,
-            buffer_types, barrier_types
+            buffer_types, barrier_types, channel.num_consumers, consumer_id
         )
 
         # Counter is an IR tensor that will be updated across calls
@@ -455,13 +489,21 @@ class ChannelReceiver(ttgl.base_value):
         num_buffers = self.num_buffers
         counter = self.counter
 
-        # Compute idx = counter % num_buffers
+        # Compute idx = (counter * num_consumers + consumer_id) % num_buffers
         num_bufs_tensor = semantic.to_tensor(ttgl.constexpr(num_buffers))
-        idx_tensor = semantic.mod(counter, num_bufs_tensor)
+        num_cons_tensor = semantic.to_tensor(ttgl.constexpr(self.num_consumers))
+        cons_id_tensor = semantic.to_tensor(ttgl.constexpr(self.consumer_id))
 
-        # Compute phase = (counter // num_buffers) & 1 (wait for ready)
+        temp = semantic.mul(counter, num_cons_tensor, sanitize_overflow=False)
+        temp = semantic.add(temp, cons_id_tensor, sanitize_overflow=False)
+        idx_tensor = semantic.mod(temp, num_bufs_tensor)
+
+        # Compute phase = (counter // (num_buffers // num_consumers)) & 1 (wait for ready)
+        # Each consumer revisits the same buffer slot every (num_buffers // num_consumers) increments
         one_tensor = semantic.to_tensor(ttgl.constexpr(1))
-        div_result = semantic.floordiv(counter, num_bufs_tensor)
+        buffers_per_consumer = num_buffers // self.num_consumers
+        bufs_per_cons_tensor = semantic.to_tensor(ttgl.constexpr(buffers_per_consumer))
+        div_result = semantic.floordiv(counter, bufs_per_cons_tensor)
         phase_tensor = semantic.and_(div_result, one_tensor)
 
         # Wait for ready barrier
@@ -492,6 +534,8 @@ class ChannelReceiver(ttgl.base_value):
         updated_receiver.buffers = self.buffers
         updated_receiver.empty_barriers = self.empty_barriers
         updated_receiver.ready_barriers = self.ready_barriers
+        updated_receiver.num_consumers = self.num_consumers
+        updated_receiver.consumer_id = self.consumer_id
         updated_receiver.counter = new_counter
         updated_receiver.type = self.type
 
@@ -512,10 +556,12 @@ class ChannelReceiver(ttgl.base_value):
         idx_tensor = buffers[-2]
         counter = buffers[-1]
 
-        # Compute phase = (counter // num_buffers) & 1, then XOR with 1 (for empty barrier)
+        # Compute phase = (counter // (num_buffers // num_consumers)) & 1, then XOR with 1 (for empty barrier)
         num_bufs_tensor = semantic.to_tensor(ttgl.constexpr(self.num_buffers))
         one_tensor = semantic.to_tensor(ttgl.constexpr(1))
-        div_result = semantic.floordiv(counter, num_bufs_tensor)
+        buffers_per_consumer = self.num_buffers // self.num_consumers
+        bufs_per_cons_tensor = semantic.to_tensor(ttgl.constexpr(buffers_per_consumer))
+        div_result = semantic.floordiv(counter, bufs_per_cons_tensor)
         and_result = semantic.and_(div_result, one_tensor)
         phase_tensor = semantic.xor_(and_result, one_tensor)
 
@@ -1061,7 +1107,7 @@ class GluonSemantic(TritonSemantic[TensorTy]):
         return tuple(unflatten_ir_values(mlir_results, [r.type for r in default_results]))
 
 
-    def create_channel(self, num_buffers, shapes, dtypes, layouts):
+    def create_channel(self, num_buffers, shapes, dtypes, layouts, num_producers=1, num_consumers=1):
         """Create a multi-buffered channel for producer-consumer communication.
 
         Args:
@@ -1069,14 +1115,29 @@ class GluonSemantic(TritonSemantic[TensorTy]):
             shapes: List of tensor shapes (one per tensor in the bundle)
             dtypes: List of dtypes (one per tensor)
             layouts: List of SharedLayouts (one per tensor)
+            num_producers: Number of producers (default 1)
+            num_consumers: Number of consumers (default 1)
 
         Returns:
-            Tuple of (sender, receiver) handles
+            Tuple of (senders, receivers) where:
+            - senders is a single sender if num_producers==1, else a list of senders
+            - receivers is a single receiver if num_consumers==1, else a list of receivers
         """
-        channel = Channel(self, num_buffers, shapes, dtypes, layouts)
-        sender = channel.sender()
-        receiver = channel.receiver()
-        return ttgl.tuple([sender, receiver])
+        channel = Channel(self, num_buffers, shapes, dtypes, layouts, num_producers, num_consumers)
+
+        # Create senders
+        if num_producers == 1:
+            senders = channel.sender(0)
+        else:
+            senders = ttgl.tuple([channel.sender(i) for i in range(num_producers)])
+
+        # Create receivers
+        if num_consumers == 1:
+            receivers = channel.receiver(0)
+        else:
+            receivers = ttgl.tuple([channel.receiver(i) for i in range(num_consumers)])
+
+        return ttgl.tuple([senders, receivers])
 
     def num_warps(self, generator):
         if generator.caller_context is not None:
