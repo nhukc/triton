@@ -118,6 +118,30 @@ class Channel:
         for shape, dtype, layout in zip(shapes, dtypes, layouts):
             full_shape = [num_buffers] + list(shape)
             buf = semantic.allocate_shared(dtype, full_shape, layout, None)
+
+            # Initialize all buffer slots with sentinel value (-999999)
+            # This helps detect uninitialized reads during debugging
+            if dtype == ttgl.int32:
+                sentinel = -999999
+            elif dtype == ttgl.float16 or dtype == ttgl.float32:
+                sentinel = -999999.0
+            else:
+                sentinel = -999999
+
+            # Create a simple blocked layout for initialization
+            # Use all available warps and threads to initialize in parallel
+            num_warps = semantic.builder.options.num_warps
+            if len(shape) == 1:
+                init_layout = ttgl.BlockedLayout([1], [32], [num_warps], [0])
+            else:
+                # For 2D tensors, use a layout that distributes work across all threads
+                init_layout = ttgl.BlockedLayout([1, 1], [1, 32], [1, num_warps], [1, 0])
+
+            for i in range(num_buffers):
+                buf_idx = semantic.memdesc_index(buf, ttgl.constexpr(i))
+                sentinel_val = semantic.full(shape, sentinel, dtype, init_layout)
+                semantic.shared_store(buf_idx, sentinel_val)
+
             self.buffers.append(buf)
 
         # Allocate barriers using hopper mbarrier
